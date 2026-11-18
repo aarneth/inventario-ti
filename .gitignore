@@ -5,3 +5,5 @@ LABORATORIO/
 *.txt
 config_inventario.json
 .claude/settings.local.json
+# Paquetes generados por Empaquetar_Release.bat (se publican como assets del release)
+dist/

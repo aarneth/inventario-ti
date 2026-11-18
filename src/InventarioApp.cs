@@ -24,8 +24,8 @@ using Microsoft.Win32;
 [assembly: AssemblyTitle("Sistema de Inventario y Auditoria TI")]
 [assembly: AssemblyProduct("Inventario TI - Wiener / Carrion")]
 [assembly: AssemblyDescription("Levantamiento y consolidacion de inventario de equipos de computo")]
-[assembly: AssemblyVersion("3.1.0.0")]
-[assembly: AssemblyFileVersion("3.1.0.0")]
+[assembly: AssemblyVersion("1.0.0.0")]
+[assembly: AssemblyFileVersion("1.0.0.0")]
 
 namespace SistemaInventarioTI
 {
@@ -275,7 +275,9 @@ namespace SistemaInventarioTI
 
         private void BuildUI()
         {
-            this.Text = "Sistema de Inventario y Auditor\u00EDa TI v3.1 (C# Nativo) - Wiener / Carri\u00F3n";
+            // La version mostrada sale de AssemblyVersion (unica fuente; ver Empaquetar_Release.bat)
+            Version ver = Assembly.GetExecutingAssembly().GetName().Version;
+            this.Text = string.Format("Sistema de Inventario y Auditor\u00EDa TI v{0}.{1}.{2} (C# Nativo) - Wiener / Carri\u00F3n", ver.Major, ver.Minor, ver.Build);
             this.Size = new Size(1180, 790);
             this.MinimumSize = new Size(1050, 700);
             this.StartPosition = FormStartPosition.CenterScreen;

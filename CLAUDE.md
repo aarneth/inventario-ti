@@ -9,7 +9,9 @@ Aplicación de escritorio Windows Forms escrita en **C# (.NET Framework 4.x)** p
      - Un `.exe` sin firma digital lo bloquea Smart App Control (PC personales) o el antivirus **aunque se ejecute como administrador**. En equipos de la institución (Kaspersky) debe aprobarse vía Seguridad TI (lista blanca por hash SHA-256 o, si se consigue, por certificado de firma de código). Cada recompilación cambia el hash.
      - **Nunca** intentar evadir Smart App Control / Kaspersky (ofuscación, empaquetadores, desactivarlos por script).
    - **Respaldo — `Iniciar_Inventario.bat`:** compila y ejecuta en memoria con `Add-Type` en PowerShell (`-Sta`) y llama a `Program.StartApp()`. Se usa si el `.exe` está bloqueado en algún equipo.
-   - Si se agrega una referencia a un ensamblado, actualizarla en **ambos** `.bat` y en el comando de verificación.
+   - Si se agrega una referencia a un ensamblado, actualizarla en `Compilar_Exe.bat`, `Iniciar_Inventario.bat`, la cabecera del `.bat` autónomo en `build/empaquetar_release.ps1` y el comando de verificación.
+   - **Distribución (releases):** `Empaquetar_Release.bat` genera `dist\InventarioTI_v<versión>.zip` con solo 2 archivos para la USB/SSD: `InventarioTI.exe` + `Iniciar_Inventario.bat` **autónomo** (lleva el código C# embebido tras el marcador `//###CODIGO_CSHARP###`; no necesita la carpeta `src`). Ese `.bat` se genera siempre desde `src/InventarioApp.cs`: nunca editarlo a mano. `dist/` no se versiona; el ZIP se sube como asset del release de GitHub (repo privado `aarneth/inventario-ti`).
+   - **Versión única:** `[assembly: AssemblyVersion]` en `src/InventarioApp.cs` (el título de la ventana la lee en tiempo de ejecución). `src/app.manifest` debe tener la misma versión; el empaquetador falla si no coinciden. Tag de release = `v<Mayor>.<Menor>.<Parche>`.
 2. **Compatibilidad estricta con C# 5:**
    - El compilador integrado de .NET Framework 4.x en Windows (`Add-Type`) soporta hasta **C# 5**.
    - **PROHIBIDO** usar sintaxis de C# 6+ (interpolación `$"..."`, operador `?.`, `nameof()`, pattern matching `is Type x`, expresiones lambda en propiedades `=>`, `record`, nullable reference types). Usar siempre `string.Format()`, comprobaciones explícitas `!= null` y bloques tradicionales.
@@ -34,6 +36,7 @@ Aplicación de escritorio Windows Forms escrita en **C# (.NET Framework 4.x)** p
 
 ## Comandos de Prueba y Verificación
 - Compilar el ejecutable (muestra el SHA-256 para Kaspersky): `.\Compilar_Exe.bat` (agregar `/nopause` en ejecución no interactiva)
+- Generar paquete de release (compila el `.exe`, crea el `.bat` autónomo y el ZIP, muestra los SHA-256): `.\Empaquetar_Release.bat` (`/nopause` en ejecución no interactiva)
 - Ejecutar aplicación: `.\InventarioTI.exe` o, como respaldo, `.\Iniciar_Inventario.bat`
 - Verificar sintaxis C# 5 rápida sin abrir ventana:
   `powershell -NoProfile -Command "$c = Get-Content src\InventarioApp.cs -Raw -Encoding UTF8; Add-Type -TypeDefinition $c -ReferencedAssemblies @('System.dll','System.Core.dll','System.Data.dll','System.Drawing.dll','System.Windows.Forms.dll','System.Management.dll','System.DirectoryServices.dll','System.IO.Compression.dll','System.IO.Compression.FileSystem.dll','System.Web.Extensions.dll','System.Xml.dll')"`
