@@ -4,9 +4,12 @@
 AplicaciÃ³n de escritorio Windows Forms escrita en **C# (.NET Framework 4.x)** para el levantamiento, auditorÃ­a y consolidaciÃ³n a Excel del inventario de equipos de cÃ³mputo de **Universidad Norbert Wiener** e **Instituto CarriÃ³n**.
 
 ## Arquitectura y Restricciones TÃ©cnicas CrÃ­ticas (NO ROMPER)
-1. **EjecuciÃ³n en Memoria (Anti-Bloqueos EDR / Smart App Control):**
-   - No compilar a `.exe` suelto para producciÃ³n en campo: Windows 11 Smart App Control y los antivirus corporativos bloquean ejecutables sin firma digital que leen WMI/Registro/AD.
-   - El cÃ³digo en `src/InventarioApp.cs` se compila y ejecuta en memoria RAM mediante `Iniciar_Inventario.bat` usando `Add-Type` en PowerShell (`-Sta`).
+1. **Dos vías de ejecución del MISMO `src/InventarioApp.cs` (ambas deben seguir funcionando):**
+   - **Principal — `InventarioTI.exe`:** generado con `Compilar_Exe.bat` (`csc.exe` de .NET Framework 4.x, `/codepage:65001`, manifiesto `src/app.manifest` con `asInvoker`: no requiere administrador, verificado que todas las consultas funcionan como usuario estándar). Entrada: `Program.Main()`.
+     - Un `.exe` sin firma digital lo bloquea Smart App Control (PC personales) o el antivirus **aunque se ejecute como administrador**. En equipos de la institución (Kaspersky) debe aprobarse vía Seguridad TI (lista blanca por hash SHA-256 o, si se consigue, por certificado de firma de código). Cada recompilación cambia el hash.
+     - **Nunca** intentar evadir Smart App Control / Kaspersky (ofuscación, empaquetadores, desactivarlos por script).
+   - **Respaldo — `Iniciar_Inventario.bat`:** compila y ejecuta en memoria con `Add-Type` en PowerShell (`-Sta`) y llama a `Program.StartApp()`. Se usa si el `.exe` está bloqueado en algún equipo.
+   - Si se agrega una referencia a un ensamblado, actualizarla en **ambos** `.bat` y en el comando de verificación.
 2. **Compatibilidad estricta con C# 5:**
    - El compilador integrado de .NET Framework 4.x en Windows (`Add-Type`) soporta hasta **C# 5**.
    - **PROHIBIDO** usar sintaxis de C# 6+ (interpolaciÃ³n `$"..."`, operador `?.`, `nameof()`, pattern matching `is Type x`, expresiones lambda en propiedades `=>`, `record`, nullable reference types). Usar siempre `string.Format()`, comprobaciones explÃ­citas `!= null` y bloques tradicionales.
@@ -29,6 +32,7 @@ AplicaciÃ³n de escritorio Windows Forms escrita en **C# (.NET Framework 4.x)**
 - **TÃ©cnicos Responsables:** Se registran en MAYÃšSCULAS usando Ãºnicamente **PRIMER NOMBRE y PRIMER APELLIDO** separados por `/` (ej. `ALVARO SORIANO/AARON GONZALES`) y se persisten en `config_inventario.json`.
 
 ## Comandos de Prueba y VerificaciÃ³n
-- Ejecutar aplicaciÃ³n: `.\Iniciar_Inventario.bat`
+- Compilar el ejecutable (muestra el SHA-256 para Kaspersky): `.\Compilar_Exe.bat` (agregar `/nopause` en ejecución no interactiva)
+- Ejecutar aplicación: `.\InventarioTI.exe` o, como respaldo, `.\Iniciar_Inventario.bat`
 - Verificar sintaxis C# 5 rÃ¡pida sin abrir ventana:
   `powershell -NoProfile -Command "$c = Get-Content src\InventarioApp.cs -Raw -Encoding UTF8; Add-Type -TypeDefinition $c -ReferencedAssemblies @('System.dll','System.Core.dll','System.Data.dll','System.Drawing.dll','System.Windows.Forms.dll','System.Management.dll','System.DirectoryServices.dll','System.IO.Compression.dll','System.IO.Compression.FileSystem.dll','System.Web.Extensions.dll','System.Xml.dll')"`

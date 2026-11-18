@@ -10,6 +10,7 @@ using System.Linq;
 using System.Management;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security;
 using System.Security.Principal;
@@ -18,6 +19,13 @@ using System.Text.RegularExpressions;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
 using Microsoft.Win32;
+
+// Metadatos visibles en Propiedades > Detalles del .exe (ayuda a Seguridad TI a identificarlo en Kaspersky)
+[assembly: AssemblyTitle("Sistema de Inventario y Auditoria TI")]
+[assembly: AssemblyProduct("Inventario TI - Wiener / Carrion")]
+[assembly: AssemblyDescription("Levantamiento y consolidacion de inventario de equipos de computo")]
+[assembly: AssemblyVersion("3.1.0.0")]
+[assembly: AssemblyFileVersion("3.1.0.0")]
 
 namespace SistemaInventarioTI
 {
@@ -1973,6 +1981,14 @@ namespace SistemaInventarioTI
 
         [DllImport("user32.dll")]
         private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+        // Punto de entrada cuando se compila como InventarioTI.exe (Compilar_Exe.bat).
+        // Iniciar_Inventario.bat no usa Main: llama a StartApp() directamente via Add-Type.
+        [STAThread]
+        public static void Main()
+        {
+            StartApp();
+        }
 
         [STAThread]
         public static void StartApp()
