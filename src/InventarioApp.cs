@@ -25,8 +25,8 @@ using Microsoft.Win32;
 [assembly: AssemblyTitle("Sistema de Inventario y Auditoria TI")]
 [assembly: AssemblyProduct("Inventario TI - Wiener / Carrion")]
 [assembly: AssemblyDescription("Levantamiento y consolidacion de inventario de equipos de computo")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyFileVersion("1.1.0.0")]
 
 namespace SistemaInventarioTI
 {
