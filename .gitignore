@@ -1,0 +1,7 @@
+ADMINISTRATIVOS/
+AULAS/
+LABORATORIO/
+*.xlsx
+*.txt
+config_inventario.json
+.claude/settings.local.json
