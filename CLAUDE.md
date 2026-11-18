@@ -34,6 +34,19 @@ Aplicación de escritorio Windows Forms escrita en **C# (.NET Framework 4.x)** p
   - `HP INSIGHTS` se calcula siempre con `CalcHpInsights()` (`SÍ` solo para HP/Hewlett, `NO` para el resto). Al editar `MARCA` en la tabla (cualquier fila, manual o desde `.txt`) se recalcula automáticamente vía `TableTodos_ColumnChanged`; `OBSERVACIÓN` **no** se modifica en ese caso (decisión del usuario).
 - **Técnicos Responsables:** Se registran en MAYÚSCULAS usando únicamente **PRIMER NOMBRE y PRIMER APELLIDO** separados por `/` (ej. `ALVARO SORIANO/AARON GONZALES`) y se persisten en `config_inventario.json`.
 
+## Gestión de Cambios (reemplazo de monitor, RAM, disco, CPU, equipo)
+- **Formato `.txt`:** se lee y escribe solo con `ParseReport()` / `ReportToLines()` (clase `InventoryReport`). No armar líneas a mano. Las correcciones manuales por columna del Excel se guardan al final como `Ajuste Manual      : COLUMNA = valor` y tienen prioridad al consolidar.
+- **Pestaña 1:** el botón **Abrir Reporte Existente** carga un `.txt` en el formulario para corregirlo. Al **GUARDAR**, `FindExistingReport()` busca el reporte vigente del hostname en **todas** las carpetas y `ComputeReportDiffs()` compara **campo por campo**: la IP, la puerta de enlace y el DNS **no** se comparan (cambian por DHCP); la MAC sí. El diálogo muestra Campo | Antes | Ahora | Usar.
+  - "Guardar y archivar" copia el reporte **ANTERIOR** como `<HOST>.<DOM>_yyyyMMdd_HHmmss.txt` y deja el nuevo como vigente. Los archivos con fecha nunca entran a la consolidación.
+  - Si cambian la Categoría o el Área, el reporte se mueve a la carpeta nueva y se borra de la anterior.
+  - Las filas de `Ajuste Manual` aparecen en amarillo y, por defecto, **se conservan** ("Antes").
+- **Pestaña 2:** "Guardar en .txt" persiste las ediciones de la tabla como `Ajuste Manual` (columna distinta del valor calculado = ajuste; igual = se elimina el ajuste). Hay aviso de cambios sin guardar al recargar, cambiar de institución o cerrar. Las filas manuales y las eliminadas solo afectan a la exportación.
+- **Exportar Excel:** si ya existe `Inventario_Consolidado_*.xlsx`, `TryReadPreviousExport()` lee su hoja `TODOS` (también si se guardó después con Excel: sharedStrings) y compara por `HOST NAME`, sin comparar `FECHA DE INVENTARIO`.
+  - Opciones del diálogo: aceptar todo lo nuevo, mantener todo lo del Excel, o elegir campo por campo.
+  - "Mantener dato del Excel" se guarda en el `.txt` como `Ajuste Manual`, para que no vuelva a preguntar.
+  - Equipos nuevos: se agregan. Equipos que ya no tienen `.txt`: se pregunta si se conservan.
+- **Layout:** el contenido de cada pestaña se construye con su tamaño de diseño (1156x650) **antes** de agregarla al `TabControl`; si no, los controles anclados abajo (GUARDAR, EXPORTAR) quedan fuera de la vista.
+
 ## Comandos de Prueba y Verificación
 - Compilar el ejecutable (muestra el SHA-256 para Kaspersky): `.\Compilar_Exe.bat` (agregar `/nopause` en ejecución no interactiva)
 - Generar paquete de release (compila el `.exe`, crea el `.bat` autónomo y el ZIP, muestra los SHA-256): `.\Empaquetar_Release.bat` (`/nopause` en ejecución no interactiva)

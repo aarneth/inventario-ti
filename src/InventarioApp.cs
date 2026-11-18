@@ -18,6 +18,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
+using System.Xml;
 using Microsoft.Win32;
 
 // Metadatos visibles en Propiedades > Detalles del .exe (ayuda a Seguridad TI a identificarlo en Kaspersky)
@@ -36,6 +37,76 @@ namespace SistemaInventarioTI
         public string Gateway;
         public string DNS;
         public string MAC;
+    }
+
+    // Representacion estructurada de un reporte <HOSTNAME>.<DOMINIO>.txt
+    public class InventoryReport
+    {
+        public static readonly string[] FieldKeys = new string[] {
+            "Categoria Ubicacion", "Area / Ambiente", "Piso Ubicacion", "Seguridad Fisica",
+            "Tipo de Equipo", "Marca", "Modelo", "Serie del Equipo", "Hostname", "Dominio / Grupo",
+            "Sistema Operativo", "Procesador", "Memoria RAM", "Almacenamiento"
+        };
+
+        public Dictionary<string, string> Fields = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        public List<string> Users = new List<string>();
+        public List<NetAdapterInfo> Nets = new List<NetAdapterInfo>();
+        public List<string> Monitors = new List<string>();
+        // Correcciones manuales por columna del Excel (lineas "Ajuste Manual : COLUMNA = valor")
+        public List<KeyValuePair<string, string>> Ajustes = new List<KeyValuePair<string, string>>();
+        public string FechaAuditoria = "";
+        public string UsuarioEjecutor = "";
+
+        public string Get(string key)
+        {
+            string v;
+            if (Fields.TryGetValue(key, out v) && v != null) return v;
+            return "";
+        }
+
+        public void Set(string key, string value)
+        {
+            Fields[key] = value ?? "";
+        }
+
+        public string GetAjuste(string column)
+        {
+            foreach (KeyValuePair<string, string> kv in Ajustes)
+            {
+                if (string.Equals(kv.Key, column, StringComparison.OrdinalIgnoreCase)) return kv.Value;
+            }
+            return null;
+        }
+
+        public void SetAjuste(string column, string value)
+        {
+            Ajustes.RemoveAll(kv => string.Equals(kv.Key, column, StringComparison.OrdinalIgnoreCase));
+            if (value != null) Ajustes.Add(new KeyValuePair<string, string>(column, value));
+        }
+
+        public static NetAdapterInfo CloneNet(NetAdapterInfo n)
+        {
+            NetAdapterInfo c = new NetAdapterInfo();
+            c.Description = n.Description ?? "";
+            c.IPv4 = n.IPv4 ?? "";
+            c.Gateway = n.Gateway ?? "";
+            c.DNS = n.DNS ?? "";
+            c.MAC = n.MAC ?? "";
+            return c;
+        }
+
+        public InventoryReport Clone()
+        {
+            InventoryReport c = new InventoryReport();
+            foreach (KeyValuePair<string, string> kv in Fields) c.Fields[kv.Key] = kv.Value;
+            c.Users.AddRange(Users);
+            foreach (NetAdapterInfo n in Nets) c.Nets.Add(CloneNet(n));
+            c.Monitors.AddRange(Monitors);
+            c.Ajustes.AddRange(Ajustes);
+            c.FechaAuditoria = FechaAuditoria;
+            c.UsuarioEjecutor = UsuarioEjecutor;
+            return c;
+        }
     }
 
     public class ConfigModel
@@ -57,6 +128,11 @@ namespace SistemaInventarioTI
         private string orgWienerGuardada = "UPNW";
         private string currentUserExec = "";
         private List<NetAdapterInfo> activeNets = new List<NetAdapterInfo>();
+        // Correcciones manuales (Ajuste Manual) del reporte abierto en la pestana 1
+        private List<KeyValuePair<string, string>> currentAjustes = new List<KeyValuePair<string, string>>();
+        // Pestana 2, por ruta de .txt: valores calculados del escaneo (sin ajustes) y valores tal como se cargaron
+        private Dictionary<string, string[]> calcByFile = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
+        private Dictionary<string, string[]> loadedByFile = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
 
         private Label lblHeaderStats;
         private ToolStripStatusLabel lblStatusText;
@@ -335,15 +411,20 @@ namespace SistemaInventarioTI
             tabScan.BackColor = Color.FromArgb(248, 250, 252);
             tabExcel.BackColor = Color.FromArgb(248, 250, 252);
 
+            // Construir el contenido con el tamano de diseno ANTES de agregar las pestanas al TabControl:
+            // los controles anclados abajo/derecha (botones GUARDAR, EXPORTAR...) calculan su posicion
+            // respecto al tamano que tiene la pestana en ese momento.
+            tabScan.Size = new Size(1156, 650);
+            tabExcel.Size = new Size(1156, 650);
+            BuildTabScan(tabScan);
+            BuildTabExcel(tabExcel);
+
             tabs.TabPages.Add(tabScan);
             tabs.TabPages.Add(tabExcel);
 
             this.Controls.Add(tabs);
             this.Controls.Add(pnlHeader);
             this.Controls.Add(statusStrip);
-
-            BuildTabScan(tabScan);
-            BuildTabExcel(tabExcel);
 
             tabs.SelectedIndexChanged += delegate {
                 if (tabs.SelectedIndex == 1) LoadTxtFilesIntoTable();
@@ -352,6 +433,10 @@ namespace SistemaInventarioTI
             this.Shown += delegate {
                 ScanCurrentHardware();
                 UpdateTxtCounterBadge();
+            };
+
+            this.FormClosing += delegate(object s, FormClosingEventArgs ev) {
+                if (!ConfirmSaveOrDiscardGridChanges()) ev.Cancel = true;
             };
         }
 
@@ -455,17 +540,27 @@ namespace SistemaInventarioTI
             Button btnRescan = new Button();
             btnRescan.Text = "Re-escanear Hardware";
             btnRescan.Location = new Point(14, 598);
-            btnRescan.Size = new Size(210, 42);
+            btnRescan.Size = new Size(180, 42);
             btnRescan.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
             btnRescan.BackColor = Color.FromArgb(226, 232, 240);
             btnRescan.FlatStyle = FlatStyle.Flat;
             btnRescan.Click += delegate { ScanCurrentHardware(); };
             page.Controls.Add(btnRescan);
 
+            Button btnOpen = new Button();
+            btnOpen.Text = "Abrir Reporte Existente (.txt)";
+            btnOpen.Location = new Point(204, 598);
+            btnOpen.Size = new Size(200, 42);
+            btnOpen.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
+            btnOpen.BackColor = Color.FromArgb(254, 243, 199);
+            btnOpen.FlatStyle = FlatStyle.Flat;
+            btnOpen.Click += BtnOpenReport_Click;
+            page.Controls.Add(btnOpen);
+
             Button btnSave = new Button();
             btnSave.Text = "GUARDAR REPORTE (.TXT) EN SUBCARPETA Y AUDITAR CAMBIOS";
-            btnSave.Location = new Point(234, 598);
-            btnSave.Size = new Size(910, 42);
+            btnSave.Location = new Point(414, 598);
+            btnSave.Size = new Size(730, 42);
             btnSave.Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
             btnSave.BackColor = Color.FromArgb(37, 99, 235);
             btnSave.ForeColor = Color.White;
@@ -517,13 +612,22 @@ namespace SistemaInventarioTI
             grpTop.Controls.Add(cmbFiltro);
 
             Button btnReload = new Button();
-            btnReload.Text = "Recargar Subcarpetas (.txt)";
+            btnReload.Text = "Recargar .txt";
             btnReload.Location = new Point(840, 21);
-            btnReload.Size = new Size(275, 28);
+            btnReload.Size = new Size(132, 28);
             btnReload.BackColor = Color.FromArgb(224, 242, 254);
             btnReload.FlatStyle = FlatStyle.Flat;
             btnReload.Click += delegate { LoadTxtFilesIntoTable(); };
             grpTop.Controls.Add(btnReload);
+
+            Button btnSaveGrid = new Button();
+            btnSaveGrid.Text = "Guardar en .txt";
+            btnSaveGrid.Location = new Point(980, 21);
+            btnSaveGrid.Size = new Size(135, 28);
+            btnSaveGrid.BackColor = Color.FromArgb(220, 252, 231);
+            btnSaveGrid.FlatStyle = FlatStyle.Flat;
+            btnSaveGrid.Click += BtnSaveGrid_Click;
+            grpTop.Controls.Add(btnSaveGrid);
 
             AddLabel(grpTop, "T\u00E9cnicos:", 12, 60, 78);
             txtTec = new TextBox();
@@ -703,6 +807,7 @@ namespace SistemaInventarioTI
         {
             this.Cursor = Cursors.WaitCursor;
             suppressPreview = true;
+            currentAjustes = new List<KeyValuePair<string, string>>();
             lblStatusText.Text = "Escaneando hardware, red, monitores y perfiles de usuario...";
             Application.DoEvents();
 
@@ -1004,7 +1109,7 @@ namespace SistemaInventarioTI
                     if (!areaMap.ContainsKey(codArea))
                     {
                         string nuevoNom = PromptInput("Nueva Sigla Detectada",
-                            string.Format("El equipo {0} contiene la sigla de área [{1}].\nIngresa el nombre completo del ÁREA (ej. ADMISION, CAJA, RRHH):", hostUpper, codArea), "");
+                            string.Format("El equipo {0} contiene la sigla de \u00E1rea [{1}].\nIngresa el nombre completo del \u00C1REA (ej. ADMISION, CAJA, RRHH):", hostUpper, codArea), "");
                         if (!string.IsNullOrWhiteSpace(nuevoNom))
                         {
                             areaMap[codArea] = nuevoNom.Trim().ToUpper();
@@ -1244,72 +1349,223 @@ namespace SistemaInventarioTI
             return mons;
         }
 
-        private List<string> BuildReportLines()
+        // ===================== Modelo del reporte .txt (lectura / escritura) =====================
+
+        private static string RptLine(string label, string value)
         {
+            return label.PadRight(19) + ": " + (value ?? "");
+        }
+
+        private static string OneLine(string s)
+        {
+            if (s == null) return "";
+            return Regex.Replace(s, @"[\r\n]+", " ").Trim();
+        }
+
+        private static string[] SplitLines(string text)
+        {
+            List<string> res = new List<string>();
+            foreach (string l in (text ?? "").Split(new char[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                if (l.Trim().Length > 0) res.Add(l.Trim());
+            }
+            return res.ToArray();
+        }
+
+        private InventoryReport BuildReportFromUI()
+        {
+            InventoryReport r = new InventoryReport();
+            r.Set("Categoria Ubicacion", cmbCat != null ? cmbCat.Text.Trim() : "");
+            r.Set("Area / Ambiente", cmbArea != null ? cmbArea.Text.Trim().ToUpper() : "");
+            r.Set("Piso Ubicacion", txtPiso != null ? txtPiso.Text.Trim().ToUpper() : "");
+            r.Set("Seguridad Fisica", cmbSeg != null ? cmbSeg.Text.Trim().ToUpper() : "");
+            r.Set("Tipo de Equipo", txtTipo != null ? txtTipo.Text.Trim() : "");
+            r.Set("Marca", txtMarca != null ? txtMarca.Text.Trim() : "");
+            r.Set("Modelo", txtModelo != null ? txtModelo.Text.Trim() : "");
+            r.Set("Serie del Equipo", txtSerie != null ? txtSerie.Text.Trim() : "");
+            r.Set("Hostname", txtHost != null ? txtHost.Text.Trim() : "");
+            r.Set("Dominio / Grupo", txtDom != null ? txtDom.Text.Trim() : "");
+            r.Set("Sistema Operativo", txtSO != null ? txtSO.Text.Trim() : "");
+            r.Set("Procesador", txtCPU != null ? txtCPU.Text.Trim() : "");
+            r.Set("Memoria RAM", txtRAM != null ? txtRAM.Text.Trim() : "");
+            r.Set("Almacenamiento", txtDisk != null ? txtDisk.Text.Trim() : "");
+
+            r.Users.AddRange(SplitLines(txtUsers != null ? txtUsers.Text : ""));
+            foreach (NetAdapterInfo n in activeNets) r.Nets.Add(InventoryReport.CloneNet(n));
+            r.Monitors.AddRange(SplitLines(txtMons != null ? txtMons.Text : ""));
+            r.Ajustes.AddRange(currentAjustes);
+
+            r.FechaAuditoria = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+            r.UsuarioEjecutor = currentUserExec;
+            return r;
+        }
+
+        private List<string> ReportToLines(InventoryReport r)
+        {
+            const string SEP = "--------------------------------------------------------";
             List<string> lines = new List<string>();
             lines.Add("========================================================");
             lines.Add("              INVENTARIO DE HARDWARE Y RED              ");
             lines.Add("========================================================");
-            lines.Add("Categoria Ubicacion: " + (cmbCat != null ? cmbCat.Text.Trim() : ""));
-            lines.Add("Area / Ambiente    : " + (cmbArea != null ? cmbArea.Text.Trim().ToUpper() : ""));
-            lines.Add("Piso Ubicacion     : " + (txtPiso != null ? txtPiso.Text.Trim().ToUpper() : ""));
-            lines.Add("Seguridad Fisica   : " + (cmbSeg != null ? cmbSeg.Text.Trim().ToUpper() : ""));
-            lines.Add("--------------------------------------------------------");
-            lines.Add("Tipo de Equipo     : " + (txtTipo != null ? txtTipo.Text.Trim() : ""));
-            lines.Add("Marca              : " + (txtMarca != null ? txtMarca.Text.Trim() : ""));
-            lines.Add("Modelo             : " + (txtModelo != null ? txtModelo.Text.Trim() : ""));
-            lines.Add("Serie del Equipo   : " + (txtSerie != null ? txtSerie.Text.Trim() : ""));
-            lines.Add("Hostname           : " + (txtHost != null ? txtHost.Text.Trim() : ""));
-            lines.Add("Dominio / Grupo    : " + (txtDom != null ? txtDom.Text.Trim() : ""));
-            lines.Add("Sistema Operativo  : " + (txtSO != null ? txtSO.Text.Trim() : ""));
-            lines.Add("Procesador         : " + (txtCPU != null ? txtCPU.Text.Trim() : ""));
-            lines.Add("Memoria RAM        : " + (txtRAM != null ? txtRAM.Text.Trim() : ""));
-            lines.Add("Almacenamiento     : " + (txtDisk != null ? txtDisk.Text.Trim() : ""));
-            lines.Add("--------------------------------------------------------");
+            for (int i = 0; i < 4; i++)
+                lines.Add(RptLine(InventoryReport.FieldKeys[i], r.Get(InventoryReport.FieldKeys[i])));
+            lines.Add(SEP);
+            for (int i = 4; i < InventoryReport.FieldKeys.Length; i++)
+                lines.Add(RptLine(InventoryReport.FieldKeys[i], r.Get(InventoryReport.FieldKeys[i])));
+            lines.Add(SEP);
 
-            string[] uSplit = (txtUsers != null ? txtUsers.Text : "").Split(new char[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
-            if (uSplit.Length > 0)
+            if (r.Users.Count > 0)
             {
-                foreach (string u in uSplit) lines.Add("Usuario Equipo     : " + u.Trim());
+                foreach (string u in r.Users) lines.Add(RptLine("Usuario Equipo", u));
             }
             else
             {
-                lines.Add("Usuario Equipo     : No se detectaron perfiles de usuario (validar presencialmente)");
+                lines.Add(RptLine("Usuario Equipo", "No se detectaron perfiles de usuario (validar presencialmente)"));
             }
 
-            if (activeNets.Count > 0)
+            if (r.Nets.Count > 0)
             {
-                foreach (NetAdapterInfo nb in activeNets)
+                foreach (NetAdapterInfo nb in r.Nets)
                 {
-                    lines.Add("--------------------------------------------------------");
-                    lines.Add("Adaptador Activo   : " + nb.Description);
-                    lines.Add("Direccion IPv4     : " + nb.IPv4);
-                    lines.Add("Puerta de Enlace   : " + nb.Gateway);
-                    lines.Add("Servidores DNS     : " + nb.DNS);
-                    lines.Add("MAC Address        : " + nb.MAC);
+                    lines.Add(SEP);
+                    lines.Add(RptLine("Adaptador Activo", nb.Description));
+                    lines.Add(RptLine("Direccion IPv4", nb.IPv4));
+                    lines.Add(RptLine("Puerta de Enlace", nb.Gateway));
+                    lines.Add(RptLine("Servidores DNS", nb.DNS));
+                    lines.Add(RptLine("MAC Address", nb.MAC));
                 }
             }
             else
             {
-                lines.Add("--------------------------------------------------------");
-                lines.Add("Red Activa         : Sin conexion activa a red (validar cable/Wi-Fi presencialmente)");
+                lines.Add(SEP);
+                lines.Add(RptLine("Red Activa", "Sin conexion activa a red (validar cable/Wi-Fi presencialmente)"));
             }
 
-            lines.Add("--------------------------------------------------------");
-            string[] mSplit = (txtMons != null ? txtMons.Text : "").Split(new char[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
-            if (mSplit.Length > 0)
+            lines.Add(SEP);
+            if (r.Monitors.Count > 0)
             {
-                foreach (string m in mSplit) lines.Add("Monitor            : " + m.Trim());
+                foreach (string m in r.Monitors) lines.Add(RptLine("Monitor", m));
             }
             else
             {
-                lines.Add("Monitor            : No se detecto monitor o no reporta datos EDID (validar presencialmente)");
+                lines.Add(RptLine("Monitor", "No se detecto monitor o no reporta datos EDID (validar presencialmente)"));
+            }
+
+            if (r.Ajustes.Count > 0)
+            {
+                lines.Add(SEP);
+                foreach (KeyValuePair<string, string> aj in r.Ajustes)
+                    lines.Add(RptLine("Ajuste Manual", OneLine(aj.Key) + " = " + OneLine(aj.Value)));
             }
 
             lines.Add("========================================================");
-            lines.Add("Fecha de Auditoria : " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
-            lines.Add("Usuario Ejecutor   : " + currentUserExec);
+            lines.Add(RptLine("Fecha de Auditoria", r.FechaAuditoria));
+            lines.Add(RptLine("Usuario Ejecutor", r.UsuarioEjecutor));
             return lines;
+        }
+
+        private List<string> BuildReportLines()
+        {
+            return ReportToLines(BuildReportFromUI());
+        }
+
+        private InventoryReport ParseReport(string[] lines)
+        {
+            InventoryReport r = new InventoryReport();
+            HashSet<string> keys = new HashSet<string>(InventoryReport.FieldKeys, StringComparer.OrdinalIgnoreCase);
+            NetAdapterInfo cur = null;
+
+            foreach (string line in lines)
+            {
+                int idx = line.IndexOf(':');
+                if (idx <= 0) continue;
+                string k = line.Substring(0, idx).Trim();
+                string v = line.Substring(idx + 1).Trim();
+
+                if (string.Equals(k, "Usuario Equipo", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (v.IndexOf("No se detectaron", StringComparison.OrdinalIgnoreCase) < 0) r.Users.Add(v);
+                }
+                else if (string.Equals(k, "Adaptador Activo", StringComparison.OrdinalIgnoreCase))
+                {
+                    cur = new NetAdapterInfo();
+                    cur.Description = v; cur.IPv4 = ""; cur.Gateway = ""; cur.DNS = ""; cur.MAC = "";
+                    r.Nets.Add(cur);
+                }
+                else if (string.Equals(k, "Direccion IPv4", StringComparison.OrdinalIgnoreCase) ||
+                         string.Equals(k, "Puerta de Enlace", StringComparison.OrdinalIgnoreCase) ||
+                         string.Equals(k, "Servidores DNS", StringComparison.OrdinalIgnoreCase) ||
+                         string.Equals(k, "MAC Address", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (cur == null)
+                    {
+                        cur = new NetAdapterInfo();
+                        cur.Description = ""; cur.IPv4 = ""; cur.Gateway = ""; cur.DNS = ""; cur.MAC = "";
+                        r.Nets.Add(cur);
+                    }
+                    if (k.StartsWith("Direccion", StringComparison.OrdinalIgnoreCase)) cur.IPv4 = v;
+                    else if (k.StartsWith("Puerta", StringComparison.OrdinalIgnoreCase)) cur.Gateway = v;
+                    else if (k.StartsWith("Servidores", StringComparison.OrdinalIgnoreCase)) cur.DNS = v;
+                    else cur.MAC = v;
+                }
+                else if (string.Equals(k, "Monitor", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (v.IndexOf("No se detecto", StringComparison.OrdinalIgnoreCase) < 0) r.Monitors.Add(v);
+                }
+                else if (string.Equals(k, "Ajuste Manual", StringComparison.OrdinalIgnoreCase))
+                {
+                    int eq = v.IndexOf(" = ", StringComparison.Ordinal);
+                    if (eq > 0) r.SetAjuste(v.Substring(0, eq).Trim(), v.Substring(eq + 3).Trim());
+                    else if (v.EndsWith(" =")) r.SetAjuste(v.Substring(0, v.Length - 2).Trim(), "");
+                }
+                else if (string.Equals(k, "Fecha de Auditoria", StringComparison.OrdinalIgnoreCase))
+                {
+                    r.FechaAuditoria = v;
+                }
+                else if (string.Equals(k, "Usuario Ejecutor", StringComparison.OrdinalIgnoreCase))
+                {
+                    r.UsuarioEjecutor = v;
+                }
+                else if (keys.Contains(k) && !r.Fields.ContainsKey(k))
+                {
+                    r.Set(k, v);
+                }
+            }
+            return r;
+        }
+
+        // Carga un reporte en los campos de la pestana 1 (para editarlo manualmente o reflejar lo guardado)
+        private void LoadReportIntoUI(InventoryReport r)
+        {
+            suppressPreview = true;
+            try
+            {
+                int ic = cmbCat.FindStringExact(r.Get("Categoria Ubicacion").ToUpper());
+                if (ic >= 0) cmbCat.SelectedIndex = ic;
+                cmbArea.Text = r.Get("Area / Ambiente");
+                txtPiso.Text = r.Get("Piso Ubicacion");
+                cmbSeg.Text = r.Get("Seguridad Fisica");
+                txtTipo.Text = r.Get("Tipo de Equipo");
+                txtMarca.Text = r.Get("Marca");
+                txtModelo.Text = r.Get("Modelo");
+                txtSerie.Text = r.Get("Serie del Equipo");
+                txtHost.Text = r.Get("Hostname");
+                txtDom.Text = r.Get("Dominio / Grupo");
+                txtSO.Text = r.Get("Sistema Operativo");
+                txtCPU.Text = r.Get("Procesador");
+                txtRAM.Text = r.Get("Memoria RAM");
+                txtDisk.Text = r.Get("Almacenamiento");
+                txtUsers.Text = string.Join(Environment.NewLine, r.Users.ToArray());
+                txtMons.Text = string.Join(Environment.NewLine, r.Monitors.ToArray());
+                activeNets = new List<NetAdapterInfo>();
+                foreach (NetAdapterInfo n in r.Nets) activeNets.Add(InventoryReport.CloneNet(n));
+                currentAjustes = new List<KeyValuePair<string, string>>(r.Ajustes);
+            }
+            finally
+            {
+                suppressPreview = false;
+                UpdatePreview();
+            }
         }
 
         private void UpdatePreview()
@@ -1342,116 +1598,414 @@ namespace SistemaInventarioTI
             UpdatePreview();
         }
 
-        private void BtnSaveTxt_Click(object sender, EventArgs e)
+        // ===================== Pestana 1: abrir, comparar por campo y guardar =====================
+
+        private class FieldDiff
         {
-            string cat = cmbCat.Text.Trim().ToUpper();
-            string are = Regex.Replace(cmbArea.Text.Trim().ToUpper(), @"[\\/:*?""<>|]", "-").Trim();
-            if (string.IsNullOrEmpty(are)) are = "GENERAL";
-
-            string dirDestino = Path.Combine(Path.Combine(baseDir, cat), are);
-            if (!Directory.Exists(dirDestino)) Directory.CreateDirectory(dirDestino);
-
-            string nombreBase = string.Format("{0}.{1}", txtHost.Text.Trim(), txtDom.Text.Trim());
-            string rutaArchivo = Path.Combine(dirDestino, nombreBase + ".txt");
-            List<string> newLines = BuildReportLines();
-
-            if (File.Exists(rutaArchivo))
-            {
-                string[] oldLines = File.ReadAllLines(rutaArchivo, Encoding.UTF8);
-                Func<string, bool> filterAudit = l => !Regex.IsMatch(l, @"^(Fecha de Auditoria|Usuario Ejecutor)\s*:");
-
-                List<string> oldClean = oldLines.Where(filterAudit).ToList();
-                List<string> newClean = newLines.Where(filterAudit).ToList();
-
-                List<string> removed = oldClean.Except(newClean).ToList();
-                List<string> added = newClean.Except(oldClean).ToList();
-
-                if (removed.Count == 0 && added.Count == 0)
-                {
-                    DialogResult dr = MessageBox.Show(
-                        string.Format("El archivo {0}.txt ya existe en {1}\\{2} y NO presenta cambios.\n\n\u00BFDeseas actualizar la fecha de auditor\u00EDa de todas formas?", nombreBase, cat, are),
-                        "Sin Cambios Detectados", MessageBoxButtons.YesNo, MessageBoxIcon.Information);
-                    if (dr == DialogResult.Yes)
-                    {
-                        File.WriteAllLines(rutaArchivo, newLines.ToArray(), Encoding.UTF8);
-                        lblStatusText.Text = "Fecha de auditor\u00EDa actualizada en " + rutaArchivo;
-                    }
-                    return;
-                }
-
-                int op = ShowDiffDialog(nombreBase, removed, added);
-                if (op == 1)
-                {
-                    File.WriteAllLines(rutaArchivo, newLines.ToArray(), Encoding.UTF8);
-                    MessageBox.Show("Archivo sobrescrito exitosamente:\n" + rutaArchivo, "Sobrescrito", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                }
-                else if (op == 2)
-                {
-                    string histPath = Path.Combine(dirDestino, string.Format("{0}_{1}.txt", nombreBase, DateTime.Now.ToString("yyyyMMdd_HHmmss")));
-                    File.WriteAllLines(histPath, newLines.ToArray(), Encoding.UTF8);
-                    MessageBox.Show("Copia hist\u00F3rica guardada en:\n" + histPath, "Historial Guardado", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                }
-            }
-            else
-            {
-                File.WriteAllLines(rutaArchivo, newLines.ToArray(), Encoding.UTF8);
-                MessageBox.Show("Reporte guardado en subcarpeta:\n" + rutaArchivo, "Reporte Guardado", MessageBoxButtons.OK, MessageBoxIcon.Information);
-            }
-            UpdateTxtCounterBadge();
+            public int Kind;      // 0 = campo simple, 1 = usuarios, 2 = monitores, 3 = red (MAC), 4 = ajuste manual
+            public string Key;
+            public string Label;
+            public string Antes;
+            public string Ahora;
+            public bool UseAntes;
         }
 
-        private int ShowDiffDialog(string nombreBase, List<string> removed, List<string> added)
+        private void BtnOpenReport_Click(object sender, EventArgs e)
         {
-            Form df = new Form();
-            df.Text = "Auditor\u00EDa de Diferencias - " + nombreBase + ".txt";
-            df.Size = new Size(740, 450);
-            df.StartPosition = FormStartPosition.CenterParent;
-            df.FormBorderStyle = FormBorderStyle.FixedDialog;
-            df.MaximizeBox = false;
+            using (OpenFileDialog dlg = new OpenFileDialog())
+            {
+                dlg.Title = "Abrir reporte de inventario existente";
+                dlg.Filter = "Reportes de inventario (*.txt)|*.txt";
+                dlg.InitialDirectory = baseDir;
+                if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+                string[] lines;
+                try { lines = File.ReadAllLines(dlg.FileName, Encoding.UTF8); }
+                catch (Exception ex)
+                {
+                    MessageBox.Show("No se pudo leer el archivo:\n" + ex.Message, "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+                if (string.Join("\n", lines).IndexOf("INVENTARIO DE HARDWARE Y RED", StringComparison.Ordinal) < 0)
+                {
+                    MessageBox.Show("El archivo seleccionado no es un reporte de inventario.", "Archivo no v\u00E1lido", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+                LoadReportIntoUI(ParseReport(lines));
+                lblStatusText.Text = "Reporte abierto para edici\u00F3n: " + RelPath(dlg.FileName) + "  (corrige los campos y presiona GUARDAR para comparar y actualizar)";
+            }
+        }
+
+        private string RelPath(string fullPath)
+        {
+            if (fullPath != null && fullPath.StartsWith(baseDir, StringComparison.OrdinalIgnoreCase))
+                return fullPath.Substring(baseDir.Length).TrimStart('\\');
+            return fullPath;
+        }
+
+        private static bool PathsEqual(string a, string b)
+        {
+            try { return string.Equals(Path.GetFullPath(a), Path.GetFullPath(b), StringComparison.OrdinalIgnoreCase); }
+            catch { return string.Equals(a, b, StringComparison.OrdinalIgnoreCase); }
+        }
+
+        private static string SafeFolderName(string s)
+        {
+            return Regex.Replace((s ?? "").Trim().ToUpper(), @"[\\/:*?""<>|]", "-").Trim();
+        }
+
+        private string GetReportPath(InventoryReport r)
+        {
+            string cat = SafeFolderName(r.Get("Categoria Ubicacion"));
+            if (cat.Length == 0) cat = "ADMINISTRATIVOS";
+            string are = SafeFolderName(r.Get("Area / Ambiente"));
+            if (are.Length == 0) are = "GENERAL";
+            string nombre = string.Format("{0}.{1}.txt", r.Get("Hostname").Trim(), r.Get("Dominio / Grupo").Trim());
+            return Path.Combine(Path.Combine(Path.Combine(baseDir, cat), are), nombre);
+        }
+
+        private void WriteReportFile(string path, InventoryReport r)
+        {
+            string dir = Path.GetDirectoryName(path);
+            if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+            File.WriteAllLines(path, ReportToLines(r).ToArray(), Encoding.UTF8);
+        }
+
+        // Busca el reporte vigente del equipo en TODAS las carpetas de inventario (no solo en la carpeta actual)
+        private FileInfo FindExistingReport(string host, string preferredPath, out int count)
+        {
+            List<FileInfo> matches = new List<FileInfo>();
+            foreach (FileInfo fi in GetInventoryTxtFiles())
+            {
+                if (!string.Equals(fi.Name.Split('.')[0], host, StringComparison.OrdinalIgnoreCase)) continue;
+                try
+                {
+                    if (File.ReadAllText(fi.FullName, Encoding.UTF8).IndexOf("INVENTARIO DE HARDWARE Y RED", StringComparison.Ordinal) >= 0)
+                        matches.Add(fi);
+                }
+                catch { }
+            }
+            count = matches.Count;
+            if (matches.Count == 0) return null;
+            foreach (FileInfo m in matches)
+            {
+                if (PathsEqual(m.FullName, preferredPath)) return m;
+            }
+            return matches.OrderByDescending(x => x.LastWriteTime).First();
+        }
+
+        // Compara por campo. La IP, puerta de enlace y DNS NO se comparan (cambian por DHCP); la MAC si.
+        private List<FieldDiff> ComputeReportDiffs(InventoryReport antes, InventoryReport ahora)
+        {
+            List<FieldDiff> list = new List<FieldDiff>();
+            foreach (string key in InventoryReport.FieldKeys)
+            {
+                string a = antes.Get(key).Trim();
+                string b = ahora.Get(key).Trim();
+                if (!string.Equals(a, b, StringComparison.Ordinal))
+                    list.Add(NewDiff(0, key, key, a, b, false));
+            }
+
+            string ua = string.Join(" | ", antes.Users.ToArray());
+            string ub = string.Join(" | ", ahora.Users.ToArray());
+            if (!string.Equals(ua, ub, StringComparison.Ordinal))
+                list.Add(NewDiff(1, "Usuario Equipo", "Usuarios del equipo", ua, ub, false));
+
+            string ma = string.Join(" | ", antes.Monitors.ToArray());
+            string mb = string.Join(" | ", ahora.Monitors.ToArray());
+            if (!string.Equals(ma, mb, StringComparison.Ordinal))
+                list.Add(NewDiff(2, "Monitor", "Monitores", ma, mb, false));
+
+            string na = string.Join(", ", antes.Nets.Select(n => n.MAC ?? "").ToArray());
+            string nb = string.Join(", ", ahora.Nets.Select(n => n.MAC ?? "").ToArray());
+            if (!string.Equals(na, nb, StringComparison.Ordinal))
+                list.Add(NewDiff(3, "MAC Address", "MAC Address (red)", na, nb, false));
+
+            List<string> cols = new List<string>();
+            foreach (KeyValuePair<string, string> kv in antes.Ajustes)
+                if (!cols.Contains(kv.Key, StringComparer.OrdinalIgnoreCase)) cols.Add(kv.Key);
+            foreach (KeyValuePair<string, string> kv in ahora.Ajustes)
+                if (!cols.Contains(kv.Key, StringComparer.OrdinalIgnoreCase)) cols.Add(kv.Key);
+            foreach (string col in cols)
+            {
+                string oa = antes.GetAjuste(col);
+                string ob = ahora.GetAjuste(col);
+                if (string.Equals(oa, ob, StringComparison.Ordinal)) continue;
+                // Por defecto se CONSERVA la correccion manual anterior; el tecnico decide si la descarta
+                list.Add(NewDiff(4, col, "Ajuste manual: " + col,
+                    oa ?? "(sin ajuste)", ob ?? "(sin ajuste: usar dato detectado)", oa != null));
+            }
+            return list;
+        }
+
+        private static FieldDiff NewDiff(int kind, string key, string label, string antes, string ahora, bool useAntes)
+        {
+            FieldDiff d = new FieldDiff();
+            d.Kind = kind; d.Key = key; d.Label = label; d.Antes = antes; d.Ahora = ahora; d.UseAntes = useAntes;
+            return d;
+        }
+
+        private InventoryReport MergeReport(InventoryReport antes, InventoryReport ahora, List<FieldDiff> diffs)
+        {
+            InventoryReport m = ahora.Clone();
+            foreach (FieldDiff d in diffs)
+            {
+                if (!d.UseAntes) continue;
+                if (d.Kind == 0) m.Set(d.Key, antes.Get(d.Key));
+                else if (d.Kind == 1) m.Users = new List<string>(antes.Users);
+                else if (d.Kind == 2) m.Monitors = new List<string>(antes.Monitors);
+                else if (d.Kind == 3)
+                {
+                    m.Nets = new List<NetAdapterInfo>();
+                    foreach (NetAdapterInfo n in antes.Nets) m.Nets.Add(InventoryReport.CloneNet(n));
+                }
+                else if (d.Kind == 4) m.SetAjuste(d.Key, antes.GetAjuste(d.Key));
+            }
+            return m;
+        }
+
+        private void BtnSaveTxt_Click(object sender, EventArgs e)
+        {
+            InventoryReport nuevo = BuildReportFromUI();
+            string host = nuevo.Get("Hostname").Trim();
+            if (host.Length == 0)
+            {
+                MessageBox.Show("El campo Hostname est\u00E1 vac\u00EDo. Compl\u00E9talo antes de guardar.", "Falta Hostname", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            string destino = GetReportPath(nuevo);
+            int cantidad;
+            FileInfo previo = FindExistingReport(host, destino, out cantidad);
+            if (previo == null)
+            {
+                WriteReportFile(destino, nuevo);
+                MessageBox.Show("Reporte guardado en subcarpeta:\n" + destino, "Reporte Guardado", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                UpdateTxtCounterBadge();
+                return;
+            }
+
+            InventoryReport anterior = ParseReport(File.ReadAllLines(previo.FullName, Encoding.UTF8));
+            List<FieldDiff> diffs = ComputeReportDiffs(anterior, nuevo);
+            if (diffs.Count == 0)
+            {
+                DialogResult dr = MessageBox.Show(
+                    string.Format("El reporte de {0} ya existe en {1} y NO presenta cambios.\n\n\u00BFDeseas actualizar la fecha de auditor\u00EDa de todas formas?", host, RelPath(previo.FullName)),
+                    "Sin Cambios Detectados", MessageBoxButtons.YesNo, MessageBoxIcon.Information);
+                if (dr == DialogResult.Yes)
+                {
+                    WriteReportFile(previo.FullName, nuevo);
+                    lblStatusText.Text = "Fecha de auditor\u00EDa actualizada en " + previo.FullName;
+                }
+                return;
+            }
+
+            int op = ShowFieldDiffDialog(host, previo, cantidad, anterior, destino, diffs);
+            if (op != 1 && op != 2) return;
+
+            InventoryReport final;
+            string resumen;
+            try
+            {
+                resumen = ApplyReportSave(previo, anterior, nuevo, diffs, op, out final);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("No se pudo guardar el reporte:\n" + ex.Message, "Error al Guardar", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+            LoadReportIntoUI(final);
+            UpdateTxtCounterBadge();
+            MessageBox.Show(resumen, "Reporte Actualizado", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        // op: 1 = archivar el reporte ANTERIOR con fecha y dejar el nuevo como vigente; 2 = sin historial
+        private string ApplyReportSave(FileInfo previo, InventoryReport anterior, InventoryReport nuevo, List<FieldDiff> diffs, int op, out InventoryReport final)
+        {
+            final = MergeReport(anterior, nuevo, diffs);
+            string destino = GetReportPath(final);
+            StringBuilder sb = new StringBuilder();
+
+            if (op == 1)
+            {
+                string dir = Path.GetDirectoryName(destino);
+                if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                string hist = Path.Combine(dir, string.Format("{0}_{1}.txt",
+                    Path.GetFileNameWithoutExtension(previo.Name), DateTime.Now.ToString("yyyyMMdd_HHmmss")));
+                File.Copy(previo.FullName, hist, true);
+                sb.Append("Reporte anterior archivado como:\n" + hist + "\n\n");
+            }
+
+            WriteReportFile(destino, final);
+            sb.Append("Reporte vigente actualizado:\n" + destino);
+
+            if (!PathsEqual(previo.FullName, destino))
+            {
+                try
+                {
+                    File.Delete(previo.FullName);
+                    sb.Append("\n\nSe movi\u00F3 desde:\n" + previo.FullName);
+                }
+                catch (Exception ex)
+                {
+                    sb.Append("\n\nNo se pudo eliminar el reporte anterior (" + ex.Message + "):\n" + previo.FullName);
+                }
+            }
+            return sb.ToString();
+        }
+
+        private static DataGridView NewCompareGrid()
+        {
+            DataGridView g = new DataGridView();
+            g.Dock = DockStyle.Fill;
+            g.AllowUserToAddRows = false;
+            g.AllowUserToDeleteRows = false;
+            g.AllowUserToResizeRows = false;
+            g.RowHeadersVisible = false;
+            g.BackgroundColor = Color.White;
+            g.BorderStyle = BorderStyle.FixedSingle;
+            g.SelectionMode = DataGridViewSelectionMode.CellSelect;
+            g.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
+            g.AutoSizeRowsMode = DataGridViewAutoSizeRowsMode.AllCells;
+            g.DefaultCellStyle.WrapMode = DataGridViewTriState.True;
+            g.EditMode = DataGridViewEditMode.EditOnEnter;
+            g.EnableHeadersVisualStyles = false;
+            g.ColumnHeadersDefaultCellStyle.BackColor = Color.FromArgb(30, 41, 59);
+            g.ColumnHeadersDefaultCellStyle.ForeColor = Color.White;
+            g.ColumnHeadersDefaultCellStyle.Font = new Font("Segoe UI Semibold", 9F);
+            return g;
+        }
+
+        private static DataGridViewTextBoxColumn TextCol(string header, float weight)
+        {
+            DataGridViewTextBoxColumn c = new DataGridViewTextBoxColumn();
+            c.HeaderText = header;
+            c.ReadOnly = true;
+            c.FillWeight = weight;
+            c.SortMode = DataGridViewColumnSortMode.NotSortable;
+            return c;
+        }
+
+        private static DataGridViewComboBoxColumn ChoiceCol(string header, float weight, string[] items)
+        {
+            DataGridViewComboBoxColumn c = new DataGridViewComboBoxColumn();
+            c.HeaderText = header;
+            c.FillWeight = weight;
+            c.FlatStyle = FlatStyle.Flat;
+            c.SortMode = DataGridViewColumnSortMode.NotSortable;
+            foreach (string it in items) c.Items.Add(it);
+            return c;
+        }
+
+        private static Button DialogButton(string text, int width, Color back, Color fore)
+        {
+            Button b = new Button();
+            b.Text = text;
+            b.Size = new Size(width, 34);
+            b.BackColor = back;
+            b.ForeColor = fore;
+            b.FlatStyle = FlatStyle.Flat;
+            b.Margin = new Padding(6, 6, 0, 0);
+            return b;
+        }
+
+        // Devuelve 1 = guardar y archivar anterior, 2 = guardar sin historial, 3 = cancelar. Marca UseAntes en cada diferencia.
+        private int ShowFieldDiffDialog(string host, FileInfo previo, int cantidad, InventoryReport anterior, string destino, List<FieldDiff> diffs)
+        {
+            Form f = new Form();
+            f.Text = "Auditor\u00EDa de Diferencias - " + host;
+            f.Size = new Size(1000, 620);
+            f.MinimumSize = new Size(760, 420);
+            f.StartPosition = FormStartPosition.CenterParent;
+            f.MinimizeBox = false;
+            f.ShowInTaskbar = false;
+            f.Font = new Font("Segoe UI", 9F);
+
+            string info = string.Format(
+                "Se detectaron {0} cambio(s) respecto al reporte anterior de {1}. En la columna \"Usar\" elige qu\u00E9 valor se guarda. (La IP, puerta de enlace y DNS no se comparan.)\nReporte anterior: {2}   |   Auditado: {3}",
+                diffs.Count, host, RelPath(previo.FullName), anterior.FechaAuditoria);
+            if (cantidad > 1)
+                info += string.Format("   |   Hay {0} reportes de este equipo; se compara con el vigente.", cantidad);
+            if (!string.Equals(Path.GetDirectoryName(previo.FullName), Path.GetDirectoryName(destino), StringComparison.OrdinalIgnoreCase))
+                info += "\nEl reporte anterior est\u00E1 en otra carpeta: si usas la Categor\u00EDa/\u00C1rea de \"Ahora\", el reporte se mover\u00E1 a la nueva ubicaci\u00F3n.";
 
             Label lbl = new Label();
-            lbl.Text = "Se detectaron cambios respecto al inventario anterior de este equipo. Selecciona qu\u00E9 acci\u00F3n realizar:";
-            lbl.Location = new Point(15, 12);
-            lbl.Size = new Size(695, 22);
-            df.Controls.Add(lbl);
+            lbl.Text = info;
+            lbl.Dock = DockStyle.Top;
+            lbl.Height = 64;
+            lbl.Padding = new Padding(10, 8, 10, 0);
 
-            RichTextBox rtb = new RichTextBox();
-            rtb.Location = new Point(15, 38);
-            rtb.Size = new Size(695, 305);
-            rtb.Font = new Font("Consolas", 9.5F);
-            rtb.ReadOnly = true;
-            rtb.BackColor = Color.FromArgb(15, 23, 42);
+            Panel pnlGrid = new Panel();
+            pnlGrid.Dock = DockStyle.Fill;
+            pnlGrid.Padding = new Padding(10, 0, 10, 0);
 
-            foreach (string r in removed)
+            FlowLayoutPanel bar = new FlowLayoutPanel();
+            bar.Dock = DockStyle.Top;
+            bar.Height = 44;
+            bar.FlowDirection = FlowDirection.LeftToRight;
+            Button bAllNew = DialogButton("Usar todo lo nuevo", 170, Color.FromArgb(224, 242, 254), Color.Black);
+            Button bAllOld = DialogButton("Mantener todo lo anterior", 190, Color.FromArgb(226, 232, 240), Color.Black);
+            Label hint = new Label();
+            hint.Text = "Filas amarillas = correcciones manuales (Ajuste Manual): por defecto se conservan.";
+            hint.AutoSize = true;
+            hint.Margin = new Padding(12, 15, 0, 0);
+            bar.Controls.Add(bAllNew);
+            bar.Controls.Add(bAllOld);
+            bar.Controls.Add(hint);
+
+            DataGridView g = NewCompareGrid();
+            g.Columns.Add(TextCol("Campo", 22));
+            g.Columns.Add(TextCol("Antes (reporte guardado)", 34));
+            g.Columns.Add(TextCol("Ahora (nuevo)", 34));
+            g.Columns.Add(ChoiceCol("Usar", 12, new string[] { "Ahora", "Antes" }));
+            foreach (FieldDiff d in diffs)
             {
-                rtb.SelectionColor = Color.FromArgb(248, 113, 113);
-                rtb.AppendText("[ANTERIOR] " + r + Environment.NewLine);
+                int ri = g.Rows.Add(d.Label, d.Antes, d.Ahora, d.UseAntes ? "Antes" : "Ahora");
+                if (d.Kind == 4) g.Rows[ri].DefaultCellStyle.BackColor = Color.FromArgb(254, 249, 195);
             }
-            foreach (string a in added)
-            {
-                rtb.SelectionColor = Color.FromArgb(74, 222, 128);
-                rtb.AppendText("[ACTUAL]   " + a + Environment.NewLine);
-            }
-            df.Controls.Add(rtb);
+            bAllNew.Click += delegate { foreach (DataGridViewRow gr in g.Rows) gr.Cells[3].Value = "Ahora"; };
+            bAllOld.Click += delegate { foreach (DataGridViewRow gr in g.Rows) gr.Cells[3].Value = "Antes"; };
+
+            pnlGrid.Controls.Add(g);
+            pnlGrid.Controls.Add(bar);
+
+            FlowLayoutPanel bottom = new FlowLayoutPanel();
+            bottom.Dock = DockStyle.Bottom;
+            bottom.Height = 54;
+            bottom.FlowDirection = FlowDirection.RightToLeft;
+            bottom.Padding = new Padding(0, 4, 10, 0);
+            Button b3 = DialogButton("Cancelar", 120, Color.FromArgb(241, 245, 249), Color.Black);
+            Button b2 = DialogButton("Guardar sin historial", 190, Color.FromArgb(21, 128, 61), Color.White);
+            Button b1 = DialogButton("Guardar y archivar el reporte anterior", 290, Color.FromArgb(37, 99, 235), Color.White);
+            bottom.Controls.Add(b3);
+            bottom.Controls.Add(b2);
+            bottom.Controls.Add(b1);
+
+            f.Controls.Add(pnlGrid);
+            f.Controls.Add(bottom);
+            f.Controls.Add(lbl);
 
             int choice = 3;
-            Button b1 = new Button() { Text = "1. Sobrescribir Existente", Location = new Point(15, 355), Size = new Size(220, 38), BackColor = Color.FromArgb(37, 99, 235), ForeColor = Color.White, FlatStyle = FlatStyle.Flat };
-            Button b2 = new Button() { Text = "2. Guardar Historial con Fecha", Location = new Point(248, 355), Size = new Size(230, 38), BackColor = Color.FromArgb(21, 128, 61), ForeColor = Color.White, FlatStyle = FlatStyle.Flat };
-            Button b3 = new Button() { Text = "3. Cancelar", Location = new Point(490, 355), Size = new Size(220, 38), FlatStyle = FlatStyle.Flat };
+            EventHandler accept = delegate(object s, EventArgs ev)
+            {
+                g.EndEdit();
+                for (int i = 0; i < diffs.Count; i++)
+                    diffs[i].UseAntes = string.Equals(Convert.ToString(g.Rows[i].Cells[3].Value), "Antes", StringComparison.Ordinal);
+                choice = (s == b1) ? 1 : 2;
+                f.Close();
+            };
+            b1.Click += accept;
+            b2.Click += accept;
+            b3.Click += delegate { choice = 3; f.Close(); };
 
-            b1.Click += delegate { choice = 1; df.Close(); };
-            b2.Click += delegate { choice = 2; df.Close(); };
-            b3.Click += delegate { choice = 3; df.Close(); };
-
-            df.Controls.Add(b1);
-            df.Controls.Add(b2);
-            df.Controls.Add(b3);
-            df.ShowDialog(this);
+            f.ShowDialog(this);
             return choice;
         }
 
         private void LoadTxtFilesIntoTable()
         {
+            if (!ConfirmSaveOrDiscardGridChanges()) return;
+
             tecnicosResponsables = txtTec.Text.Trim().ToUpper();
             orgWienerGuardada = txtOrgW.Text.Trim().ToUpper();
             SaveConfig();
@@ -1459,6 +2013,9 @@ namespace SistemaInventarioTI
             tableTodos = new DataTable("INVENTARIO");
             foreach (string col in headersAdm) tableTodos.Columns.Add(col);
             tableTodos.Columns.Add("_CATEGORIA_INTERNA");
+            tableTodos.Columns.Add("_ARCHIVO");
+            calcByFile = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
+            loadedByFile = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
 
             List<FileInfo> candidateFiles = GetInventoryTxtFiles();
             List<FileInfo> validFiles = new List<FileInfo>();
@@ -1681,8 +2238,32 @@ namespace SistemaInventarioTI
                     tipo, piso, "OPERATIVO", marca, modelo, serie, cpu, ram, discoDuro,
                     macPrincipal, hostName, monModelo, monSerie, area, remachado, aulaLabAdm,
                     fechaInv, orgActual, "S\u00CD", usuariosFinal, correosFinal, "S\u00CD", hpInsights,
-                    "", "", tecnicosResponsables, obs, pestanaDestino
+                    "", "", tecnicosResponsables, obs, pestanaDestino, file.FullName
                 };
+
+                // Valores calculados desde el escaneo (sin correcciones manuales)
+                string[] calc = new string[headersAdm.Length];
+                for (int ci = 0; ci < headersAdm.Length; ci++) calc[ci] = Convert.ToString(vals[ci]);
+
+                // Aplicar las correcciones manuales guardadas en el .txt (lineas "Ajuste Manual")
+                bool ajMarca = false;
+                bool ajHp = false;
+                foreach (KeyValuePair<string, string> aj in ParseReport(lines).Ajustes)
+                {
+                    int ci = ColIdx(aj.Key);
+                    if (ci < 0) continue;
+                    vals[ci] = aj.Value;
+                    if (ci == ColIdx("MARCA")) ajMarca = true;
+                    if (ci == ColIdx("HP INSIGHTS")) ajHp = true;
+                }
+                if (ajMarca && !ajHp)
+                    vals[ColIdx("HP INSIGHTS")] = CalcHpInsights(Convert.ToString(vals[ColIdx("MARCA")]));
+
+                string[] loaded = new string[headersAdm.Length];
+                for (int ci = 0; ci < headersAdm.Length; ci++) loaded[ci] = Convert.ToString(vals[ci]);
+                calcByFile[file.FullName] = calc;
+                loadedByFile[file.FullName] = loaded;
+
                 row.ItemArray = vals;
                 tableTodos.Rows.Add(row);
             }
@@ -1725,6 +2306,8 @@ namespace SistemaInventarioTI
             grid.DataSource = dv;
             if (grid.Columns["_CATEGORIA_INTERNA"] != null)
                 grid.Columns["_CATEGORIA_INTERNA"].Visible = false;
+            if (grid.Columns["_ARCHIVO"] != null)
+                grid.Columns["_ARCHIVO"].Visible = false;
 
             if (grid.Columns["OBSERVACI\u00D3N"] != null)
                 grid.Columns["OBSERVACI\u00D3N"].Visible = (filtro != "AULAS" && filtro != "LABORATORIO");
@@ -1776,6 +2359,10 @@ namespace SistemaInventarioTI
             {
                 foreach (DataRow r in tableTodos.Rows)
                     r["TECNICO RESPONSABLE"] = tecnicosResponsables;
+                // No es una correccion manual: actualizar las referencias para que no se guarde como Ajuste Manual
+                int it = ColIdx("TECNICO RESPONSABLE");
+                foreach (string[] snap in calcByFile.Values) snap[it] = tecnicosResponsables;
+                foreach (string[] snap in loadedByFile.Values) snap[it] = tecnicosResponsables;
             }
         }
 
@@ -1856,6 +2443,533 @@ namespace SistemaInventarioTI
                 "Copiado al Portapapeles", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
 
+        // ===================== Pestana 2: correcciones manuales persistentes en el .txt =====================
+
+        private int ColIdx(string name)
+        {
+            for (int i = 0; i < headersAdm.Length; i++)
+            {
+                if (string.Equals(headersAdm[i], name, StringComparison.OrdinalIgnoreCase)) return i;
+            }
+            return -1;
+        }
+
+        private string[] GetRowValues(DataRow row)
+        {
+            string[] v = new string[headersAdm.Length];
+            for (int i = 0; i < headersAdm.Length; i++) v[i] = Convert.ToString(row[i]);
+            return v;
+        }
+
+        private void CommitGridEdit()
+        {
+            if (grid == null) return;
+            try
+            {
+                grid.EndEdit();
+                if (grid.DataSource != null && grid.BindingContext != null)
+                    grid.BindingContext[grid.DataSource].EndCurrentEdit();
+            }
+            catch { }
+        }
+
+        // Filas cargadas desde .txt cuyo contenido cambio respecto a lo que se cargo
+        private List<DataRow> GetPendingGridRows()
+        {
+            List<DataRow> list = new List<DataRow>();
+            if (tableTodos == null) return list;
+            CommitGridEdit();
+            foreach (DataRow row in tableTodos.Rows)
+            {
+                if (row.RowState == DataRowState.Deleted || row.RowState == DataRowState.Detached) continue;
+                string path = Convert.ToString(row["_ARCHIVO"]);
+                string[] loaded;
+                if (path.Length == 0 || !loadedByFile.TryGetValue(path, out loaded)) continue;
+                string[] cur = GetRowValues(row);
+                for (int i = 0; i < cur.Length; i++)
+                {
+                    if (!string.Equals(cur[i], loaded[i], StringComparison.Ordinal))
+                    {
+                        list.Add(row);
+                        break;
+                    }
+                }
+            }
+            return list;
+        }
+
+        // Guarda en el .txt como "Ajuste Manual" cada columna que difiere del valor calculado desde el escaneo
+        private void SaveRowAjustesToTxt(DataRow row)
+        {
+            string path = Convert.ToString(row["_ARCHIVO"]);
+            string[] calc;
+            if (path.Length == 0 || !calcByFile.TryGetValue(path, out calc) || !File.Exists(path)) return;
+
+            string[] cur = GetRowValues(row);
+            InventoryReport rep = ParseReport(File.ReadAllLines(path, Encoding.UTF8));
+            rep.Ajustes.Clear();
+            for (int i = 0; i < cur.Length; i++)
+            {
+                if (!string.Equals(cur[i].Trim(), calc[i].Trim(), StringComparison.Ordinal))
+                    rep.Ajustes.Add(new KeyValuePair<string, string>(headersAdm[i], OneLine(cur[i])));
+            }
+            File.WriteAllLines(path, ReportToLines(rep).ToArray(), Encoding.UTF8);
+            loadedByFile[path] = cur;
+        }
+
+        private int SaveGridRows(List<DataRow> rows)
+        {
+            int ok = 0;
+            List<string> errores = new List<string>();
+            foreach (DataRow row in rows)
+            {
+                try
+                {
+                    SaveRowAjustesToTxt(row);
+                    ok++;
+                }
+                catch (Exception ex)
+                {
+                    errores.Add(Convert.ToString(row["HOST NAME"]) + ": " + ex.Message);
+                }
+            }
+            if (errores.Count > 0)
+            {
+                MessageBox.Show("No se pudieron guardar algunos equipos:\n\n" + string.Join("\n", errores.ToArray()),
+                    "Error al Guardar", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+            return ok;
+        }
+
+        private void BtnSaveGrid_Click(object sender, EventArgs e)
+        {
+            List<DataRow> rows = GetPendingGridRows();
+            if (rows.Count == 0)
+            {
+                MessageBox.Show("No hay cambios en la tabla pendientes de guardar en los .txt.\n\n(Las filas manuales y las filas eliminadas solo afectan a la exportaci\u00F3n.)",
+                    "Sin Cambios", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            int n = SaveGridRows(rows);
+            lblStatusText.Text = string.Format("Se guardaron los cambios de {0} equipo(s) en sus .txt.", n);
+            MessageBox.Show(string.Format("Se guardaron los cambios de {0} equipo(s) en sus archivos .txt como correcciones manuales (Ajuste Manual).\n\nSe conservar\u00E1n al recargar la tabla y en las pr\u00F3ximas exportaciones.", n),
+                "Cambios Guardados", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        // true = se puede continuar (guardado o descartado); false = el usuario cancelo
+        private bool ConfirmSaveOrDiscardGridChanges()
+        {
+            List<DataRow> rows = GetPendingGridRows();
+            if (rows.Count == 0) return true;
+            DialogResult dr = MessageBox.Show(
+                string.Format("Hay cambios en la tabla de {0} equipo(s) que no se han guardado en sus .txt.\n\n\u00BFDeseas guardarlos antes de continuar?\n\nS\u00ED = guardar     No = descartar     Cancelar = volver a la tabla", rows.Count),
+                "Cambios sin Guardar", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Warning);
+            if (dr == DialogResult.Cancel) return false;
+            if (dr == DialogResult.Yes) SaveGridRows(rows);
+            return true;
+        }
+
+        // ===================== Comparacion con el Excel exportado anterior =====================
+
+        private class ExcelCellDiff
+        {
+            public string Host;
+            public string Column;
+            public string OldVal;
+            public string NewVal;
+            public DataRow Row;
+            public bool UseOld;
+        }
+
+        private class ExcelMissingRow
+        {
+            public string Host;
+            public Dictionary<string, string> Values;
+            public bool Keep = true;
+        }
+
+        private static XmlDocument LoadZipXml(ZipArchive zip, string entryName)
+        {
+            ZipArchiveEntry entry = zip.GetEntry(entryName);
+            if (entry == null) return null;
+            XmlDocument doc = new XmlDocument();
+            doc.XmlResolver = null;
+            using (Stream s = entry.Open()) doc.Load(s);
+            return doc;
+        }
+
+        private static int ColumnIndexFromRef(string cellRef)
+        {
+            int idx = 0;
+            foreach (char ch in cellRef.ToUpperInvariant())
+            {
+                if (ch < 'A' || ch > 'Z') break;
+                idx = idx * 26 + (ch - 'A' + 1);
+            }
+            return idx;
+        }
+
+        // Lee la hoja TODOS (o la primera) de un .xlsx: generado por este programa o guardado despues con Excel
+        private bool TryReadPreviousExport(string path, out Dictionary<string, Dictionary<string, string>> rowsByHost, out string error)
+        {
+            rowsByHost = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
+            error = "";
+            const string nsMain = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+            const string nsRel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+            const string nsPkg = "http://schemas.openxmlformats.org/package/2006/relationships";
+            try
+            {
+                using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                using (ZipArchive zip = new ZipArchive(fs, ZipArchiveMode.Read))
+                {
+                    XmlDocument wb = LoadZipXml(zip, "xl/workbook.xml");
+                    XmlDocument rels = LoadZipXml(zip, "xl/_rels/workbook.xml.rels");
+                    if (wb == null || rels == null) { error = "El archivo no tiene la estructura de un .xlsx."; return false; }
+
+                    string relId = null;
+                    string firstRelId = null;
+                    foreach (XmlElement sh in wb.GetElementsByTagName("sheet", nsMain))
+                    {
+                        string rid = sh.GetAttribute("id", nsRel);
+                        if (firstRelId == null) firstRelId = rid;
+                        if (string.Equals(sh.GetAttribute("name"), "TODOS", StringComparison.OrdinalIgnoreCase)) relId = rid;
+                    }
+                    if (relId == null) relId = firstRelId;
+                    if (relId == null) { error = "El Excel no contiene hojas."; return false; }
+
+                    string target = null;
+                    foreach (XmlElement rel in rels.GetElementsByTagName("Relationship", nsPkg))
+                    {
+                        if (rel.GetAttribute("Id") == relId) target = rel.GetAttribute("Target");
+                    }
+                    if (string.IsNullOrEmpty(target)) { error = "No se encontr\u00F3 la hoja TODOS."; return false; }
+                    string sheetEntry = target.StartsWith("/") ? target.TrimStart('/') : "xl/" + target;
+
+                    List<string> shared = new List<string>();
+                    XmlDocument sst = LoadZipXml(zip, "xl/sharedStrings.xml");
+                    if (sst != null)
+                    {
+                        foreach (XmlElement item in sst.GetElementsByTagName("si", nsMain))
+                        {
+                            StringBuilder sbs = new StringBuilder();
+                            foreach (XmlElement t in item.GetElementsByTagName("t", nsMain))
+                            {
+                                if (t.ParentNode != null && t.ParentNode.LocalName == "rPh") continue;
+                                sbs.Append(t.InnerText);
+                            }
+                            shared.Add(sbs.ToString());
+                        }
+                    }
+
+                    XmlDocument sheet = LoadZipXml(zip, sheetEntry);
+                    if (sheet == null) { error = "No se pudo leer la hoja " + sheetEntry; return false; }
+
+                    Dictionary<int, string> headers = null;
+                    foreach (XmlElement rowEl in sheet.GetElementsByTagName("row", nsMain))
+                    {
+                        Dictionary<int, string> cells = new Dictionary<int, string>();
+                        int pos = 0;
+                        foreach (XmlNode node in rowEl.ChildNodes)
+                        {
+                            XmlElement c = node as XmlElement;
+                            if (c == null || c.LocalName != "c") continue;
+                            pos++;
+                            string cref = c.GetAttribute("r");
+                            int col = string.IsNullOrEmpty(cref) ? pos : ColumnIndexFromRef(cref);
+                            pos = col;
+                            string type = c.GetAttribute("t");
+                            string val;
+                            if (type == "inlineStr")
+                            {
+                                StringBuilder sbi = new StringBuilder();
+                                foreach (XmlElement t in c.GetElementsByTagName("t", nsMain)) sbi.Append(t.InnerText);
+                                val = sbi.ToString();
+                            }
+                            else
+                            {
+                                XmlNodeList vs = c.GetElementsByTagName("v", nsMain);
+                                string raw = vs.Count > 0 ? vs[0].InnerText : "";
+                                int sIdx;
+                                if (type == "s" && int.TryParse(raw, out sIdx) && sIdx >= 0 && sIdx < shared.Count) val = shared[sIdx];
+                                else val = raw;
+                            }
+                            cells[col] = val;
+                        }
+
+                        if (headers == null)
+                        {
+                            headers = cells;
+                            continue;
+                        }
+
+                        Dictionary<string, string> data = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                        foreach (KeyValuePair<int, string> h in headers)
+                        {
+                            string name = (h.Value ?? "").Trim();
+                            if (name.Length == 0 || data.ContainsKey(name)) continue;
+                            string cv;
+                            data[name] = cells.TryGetValue(h.Key, out cv) ? cv : "";
+                        }
+                        string host;
+                        if (!data.TryGetValue("HOST NAME", out host) || string.IsNullOrWhiteSpace(host)) continue;
+                        rowsByHost[host.Trim()] = data;
+                    }
+
+                    bool tieneHost = false;
+                    if (headers != null)
+                    {
+                        foreach (string hv in headers.Values)
+                            if (string.Equals((hv ?? "").Trim(), "HOST NAME", StringComparison.OrdinalIgnoreCase)) tieneHost = true;
+                    }
+                    if (!tieneHost) { error = "La hoja no tiene la columna HOST NAME."; return false; }
+                }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+        }
+
+        private void ComputeExcelComparison(Dictionary<string, Dictionary<string, string>> anteriores,
+            List<ExcelCellDiff> diffs, List<ExcelMissingRow> missing, List<string> nuevos)
+        {
+            CommitGridEdit();
+            HashSet<string> actuales = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (DataRow row in tableTodos.Rows)
+            {
+                if (row.RowState == DataRowState.Deleted || row.RowState == DataRowState.Detached) continue;
+                string host = Convert.ToString(row["HOST NAME"]).Trim();
+                if (host.Length == 0) continue;
+                actuales.Add(host);
+
+                Dictionary<string, string> previo;
+                if (!anteriores.TryGetValue(host, out previo))
+                {
+                    nuevos.Add(host);
+                    continue;
+                }
+                foreach (string col in headersAdm)
+                {
+                    if (col == "FECHA DE INVENTARIO") continue;
+                    string ov;
+                    if (!previo.TryGetValue(col, out ov)) continue;
+                    ov = (ov ?? "").Trim();
+                    string nv = Convert.ToString(row[col]).Trim();
+                    if (string.Equals(ov, nv, StringComparison.Ordinal)) continue;
+                    ExcelCellDiff d = new ExcelCellDiff();
+                    d.Host = host; d.Column = col; d.OldVal = ov; d.NewVal = nv; d.Row = row;
+                    diffs.Add(d);
+                }
+            }
+            foreach (KeyValuePair<string, Dictionary<string, string>> kv in anteriores)
+            {
+                if (actuales.Contains(kv.Key)) continue;
+                ExcelMissingRow m = new ExcelMissingRow();
+                m.Host = kv.Key;
+                m.Values = kv.Value;
+                missing.Add(m);
+            }
+        }
+
+        private void ApplyExcelChoices(List<ExcelCellDiff> diffs, List<ExcelMissingRow> missing)
+        {
+            // MARCA primero: asi la regla de HP INSIGHTS se recalcula antes que el resto de columnas
+            List<ExcelCellDiff> elegidos = diffs.Where(x => x.UseOld).OrderBy(x => x.Column == "MARCA" ? 0 : 1).ToList();
+            List<DataRow> tocadas = new List<DataRow>();
+            foreach (ExcelCellDiff d in elegidos)
+            {
+                d.Row[d.Column] = d.OldVal;
+                if (!tocadas.Contains(d.Row)) tocadas.Add(d.Row);
+            }
+            // La decision "mantener dato del Excel" se guarda en el .txt para no volver a preguntar
+            if (tocadas.Count > 0) SaveGridRows(tocadas);
+
+            foreach (ExcelMissingRow m in missing)
+            {
+                if (!m.Keep) continue;
+                DataRow r = tableTodos.NewRow();
+                foreach (string col in headersAdm)
+                {
+                    string v;
+                    r[col] = m.Values.TryGetValue(col, out v) ? v : "";
+                }
+                string amb = Convert.ToString(r["AULA / LAB / ADMINISTRATIVO"]).Trim().ToUpper();
+                string cat = "ADMINISTRATIVOS";
+                if (amb.StartsWith("AULA")) cat = "AULAS";
+                else if (amb.StartsWith("LAB")) cat = "LABORATORIO";
+                r["_CATEGORIA_INTERNA"] = cat;
+                r["_ARCHIVO"] = "";
+                tableTodos.Rows.Add(r);
+            }
+            ApplyGridFilter();
+        }
+
+        // false = el usuario cancelo la exportacion
+        private bool RunExcelComparison(Dictionary<string, Dictionary<string, string>> anteriores, out int nuevosCount)
+        {
+            List<ExcelCellDiff> diffs = new List<ExcelCellDiff>();
+            List<ExcelMissingRow> missing = new List<ExcelMissingRow>();
+            List<string> nuevos = new List<string>();
+            ComputeExcelComparison(anteriores, diffs, missing, nuevos);
+            nuevosCount = nuevos.Count;
+            if (diffs.Count == 0 && missing.Count == 0) return true;
+            if (!ShowExcelCompareDialog(diffs, missing, nuevos)) return false;
+            ApplyExcelChoices(diffs, missing);
+            return true;
+        }
+
+        private bool ShowExcelCompareDialog(List<ExcelCellDiff> diffs, List<ExcelMissingRow> missing, List<string> nuevos)
+        {
+            Form f = new Form();
+            f.Text = "Comparaci\u00F3n con el Excel exportado anterior";
+            f.Size = new Size(1040, 660);
+            f.MinimumSize = new Size(800, 460);
+            f.StartPosition = FormStartPosition.CenterParent;
+            f.MinimizeBox = false;
+            f.ShowInTaskbar = false;
+            f.Font = new Font("Segoe UI", 9F);
+
+            HashSet<string> hostsCambiados = new HashSet<string>(diffs.Select(x => x.Host), StringComparer.OrdinalIgnoreCase);
+            Label lbl = new Label();
+            lbl.Dock = DockStyle.Top;
+            lbl.Padding = new Padding(10, 8, 10, 0);
+            lbl.Text = string.Format(
+                "Se compararon los datos actuales con el Excel exportado anteriormente (por HOST NAME; la FECHA DE INVENTARIO no se compara).\nCampos distintos: {0} en {1} equipo(s)   |   Equipos nuevos: {2}   |   Equipos que ya no est\u00E1n: {3}",
+                diffs.Count, hostsCambiados.Count, nuevos.Count, missing.Count);
+            lbl.Height = 52;
+            if (nuevos.Count > 0)
+            {
+                lbl.Text += "\nEquipos nuevos (se agregan al Excel): " + string.Join(", ", nuevos.Take(15).ToArray()) + (nuevos.Count > 15 ? " ..." : "");
+                lbl.Height = 70;
+            }
+
+            DataGridView g1 = null;
+            Panel pnlDiff = null;
+            if (diffs.Count > 0)
+            {
+                pnlDiff = new Panel();
+                pnlDiff.Dock = DockStyle.Fill;
+                pnlDiff.Padding = new Padding(10, 0, 10, 0);
+
+                FlowLayoutPanel bar = new FlowLayoutPanel();
+                bar.Dock = DockStyle.Top;
+                bar.Height = 44;
+                Button bNew = DialogButton("Aceptar todos los datos nuevos", 220, Color.FromArgb(224, 242, 254), Color.Black);
+                Button bOld = DialogButton("Mantener todos los del Excel", 210, Color.FromArgb(226, 232, 240), Color.Black);
+                Label hint = new Label();
+                hint.Text = "O elige campo por campo en la columna \"Usar\".";
+                hint.AutoSize = true;
+                hint.Margin = new Padding(12, 15, 0, 0);
+                bar.Controls.Add(bNew);
+                bar.Controls.Add(bOld);
+                bar.Controls.Add(hint);
+
+                g1 = NewCompareGrid();
+                g1.Columns.Add(TextCol("Equipo", 16));
+                g1.Columns.Add(TextCol("Campo", 18));
+                g1.Columns.Add(TextCol("Excel anterior", 27));
+                g1.Columns.Add(TextCol("Actual (.txt / tabla)", 27));
+                g1.Columns.Add(ChoiceCol("Usar", 14, new string[] { "Actual", "Excel anterior" }));
+                foreach (ExcelCellDiff d in diffs) g1.Rows.Add(d.Host, d.Column, d.OldVal, d.NewVal, "Actual");
+
+                DataGridView gRef = g1;
+                bNew.Click += delegate { foreach (DataGridViewRow gr in gRef.Rows) gr.Cells[4].Value = "Actual"; };
+                bOld.Click += delegate { foreach (DataGridViewRow gr in gRef.Rows) gr.Cells[4].Value = "Excel anterior"; };
+
+                pnlDiff.Controls.Add(g1);
+                pnlDiff.Controls.Add(bar);
+            }
+
+            DataGridView g2 = null;
+            Panel pnlMiss = null;
+            if (missing.Count > 0)
+            {
+                pnlMiss = new Panel();
+                pnlMiss.Padding = new Padding(10, 4, 10, 4);
+                Label lm = new Label();
+                lm.Text = "Equipos que estaban en el Excel anterior y ya no tienen .txt. Marca \"Conservar\" para mantenerlos en el nuevo Excel:";
+                lm.Dock = DockStyle.Top;
+                lm.Height = 24;
+                g2 = NewCompareGrid();
+                g2.Columns.Add(TextCol("Equipo", 22));
+                g2.Columns.Add(TextCol("\u00C1rea", 30));
+                g2.Columns.Add(TextCol("Aula / Lab / Administrativo", 30));
+                DataGridViewCheckBoxColumn keepCol = new DataGridViewCheckBoxColumn();
+                keepCol.HeaderText = "Conservar";
+                keepCol.FillWeight = 12;
+                keepCol.SortMode = DataGridViewColumnSortMode.NotSortable;
+                g2.Columns.Add(keepCol);
+                foreach (ExcelMissingRow m in missing)
+                {
+                    string area, amb;
+                    if (!m.Values.TryGetValue("AREA", out area)) area = "";
+                    if (!m.Values.TryGetValue("AULA / LAB / ADMINISTRATIVO", out amb)) amb = "";
+                    g2.Rows.Add(m.Host, area, amb, m.Keep);
+                }
+                pnlMiss.Controls.Add(g2);
+                pnlMiss.Controls.Add(lm);
+            }
+
+            FlowLayoutPanel bottom = new FlowLayoutPanel();
+            bottom.Dock = DockStyle.Bottom;
+            bottom.Height = 54;
+            bottom.FlowDirection = FlowDirection.RightToLeft;
+            bottom.Padding = new Padding(0, 4, 10, 0);
+            Button bCancel = DialogButton("Cancelar Exportaci\u00F3n", 170, Color.FromArgb(241, 245, 249), Color.Black);
+            Button bOk = DialogButton("Aplicar y Exportar", 190, Color.FromArgb(21, 128, 61), Color.White);
+            bottom.Controls.Add(bCancel);
+            bottom.Controls.Add(bOk);
+
+            if (pnlDiff != null)
+            {
+                f.Controls.Add(pnlDiff);
+                if (pnlMiss != null)
+                {
+                    pnlMiss.Dock = DockStyle.Bottom;
+                    pnlMiss.Height = 200;
+                    f.Controls.Add(pnlMiss);
+                }
+            }
+            else if (pnlMiss != null)
+            {
+                pnlMiss.Dock = DockStyle.Fill;
+                f.Controls.Add(pnlMiss);
+            }
+            f.Controls.Add(bottom);
+            f.Controls.Add(lbl);
+
+            bool aplicar = false;
+            DataGridView g1Ref = g1;
+            DataGridView g2Ref = g2;
+            bOk.Click += delegate
+            {
+                if (g1Ref != null) g1Ref.EndEdit();
+                if (g2Ref != null) g2Ref.EndEdit();
+                aplicar = true;
+                f.Close();
+            };
+            bCancel.Click += delegate { f.Close(); };
+            f.ShowDialog(this);
+            if (!aplicar) return false;
+
+            if (g1 != null)
+            {
+                for (int i = 0; i < diffs.Count; i++)
+                    diffs[i].UseOld = string.Equals(Convert.ToString(g1.Rows[i].Cells[4].Value), "Excel anterior", StringComparison.Ordinal);
+            }
+            if (g2 != null)
+            {
+                for (int i = 0; i < missing.Count; i++)
+                {
+                    object cv = g2.Rows[i].Cells[3].Value;
+                    missing[i].Keep = cv is bool && (bool)cv;
+                }
+            }
+            return true;
+        }
+
         private void BtnExportXlsx_Click(object sender, EventArgs e)
         {
             if (tableTodos == null || tableTodos.Rows.Count == 0) LoadTxtFilesIntoTable();
@@ -1867,6 +2981,26 @@ namespace SistemaInventarioTI
 
             string sufijo = cmbInst.SelectedIndex == 1 ? "Carrion" : (cmbInst.SelectedIndex == 2 ? "Wiener" : "General");
             string xlsxPath = Path.Combine(baseDir, "Inventario_Consolidado_" + sufijo + ".xlsx");
+
+            // Comparar con el Excel exportado anterior antes de reemplazarlo
+            int nuevosVsAnterior = -1;
+            if (File.Exists(xlsxPath))
+            {
+                Dictionary<string, Dictionary<string, string>> anteriores;
+                string errLectura;
+                if (TryReadPreviousExport(xlsxPath, out anteriores, out errLectura))
+                {
+                    if (!RunExcelComparison(anteriores, out nuevosVsAnterior)) return;
+                }
+                else
+                {
+                    DialogResult drSin = MessageBox.Show(
+                        "No se pudo leer el Excel anterior para comparar los cambios:\n" + errLectura + "\n\n(Si est\u00E1 abierto en Excel, ci\u00E9rralo y vuelve a exportar.)\n\n\u00BFDeseas exportar de todas formas sin comparar?",
+                        "Comparaci\u00F3n no disponible", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+                    if (drSin != DialogResult.Yes) return;
+                }
+            }
+
             if (File.Exists(xlsxPath))
             {
                 try { File.Delete(xlsxPath); }
@@ -1879,6 +3013,17 @@ namespace SistemaInventarioTI
             List<string[]> rowsLab = GetRowsByCategory("LABORATORIO", 26);
             List<string[]> rowsAll = GetRowsByCategory("TODOS", 27);
 
+            WriteConsolidatedXlsx(xlsxPath, headers26, rowsAdm, rowsAu, rowsLab, rowsAll);
+
+            DialogResult open = MessageBox.Show(
+                string.Format("Archivo Excel generado exitosamente en:\n{0}\n\n- ADMINISTRATIVOS: {1}\n- AULAS: {2}\n- LABORATORIO: {3}{4}\n\n\u00BFDeseas abrir el archivo Excel ahora?", xlsxPath, rowsAdm.Count, rowsAu.Count, rowsLab.Count, nuevosVsAnterior >= 0 ? "\n- Equipos nuevos respecto al Excel anterior: " + nuevosVsAnterior : ""),
+                "Excel Generado", MessageBoxButtons.YesNo, MessageBoxIcon.Information);
+            if (open == DialogResult.Yes)
+                Process.Start(xlsxPath);
+        }
+
+        private void WriteConsolidatedXlsx(string xlsxPath, string[] headers26, List<string[]> rowsAdm, List<string[]> rowsAu, List<string[]> rowsLab, List<string[]> rowsAll)
+        {
             using (FileStream fs = new FileStream(xlsxPath, FileMode.Create))
             using (ZipArchive zip = new ZipArchive(fs, ZipArchiveMode.Create))
             {
@@ -1902,12 +3047,6 @@ namespace SistemaInventarioTI
                 WriteZipEntry(zip, "xl/worksheets/sheet3.xml", BuildSheetXml(headers26, rowsLab));
                 WriteZipEntry(zip, "xl/worksheets/sheet4.xml", BuildSheetXml(headersAdm, rowsAll));
             }
-
-            DialogResult open = MessageBox.Show(
-                string.Format("Archivo Excel generado exitosamente en:\n{0}\n\n- ADMINISTRATIVOS: {1}\n- AULAS: {2}\n- LABORATORIO: {3}\n\n\u00BFDeseas abrir el archivo Excel ahora?", xlsxPath, rowsAdm.Count, rowsAu.Count, rowsLab.Count),
-                "Excel Generado", MessageBoxButtons.YesNo, MessageBoxIcon.Information);
-            if (open == DialogResult.Yes)
-                Process.Start(xlsxPath);
         }
 
         private string GetColLetter(int colIndex)

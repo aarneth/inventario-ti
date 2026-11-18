@@ -17,6 +17,12 @@ El flujo operativo consta de dos fases integradas en una interfaz gráfica de do
 - **Sin elevación (2026-11-18):** Se probó sin privilegios de administrador cada consulta del programa (`Win32_ComputerSystem`, `Win32_SystemEnclosure`, `Win32_ComputerSystemProduct`, `Win32_BIOS`, `Win32_BaseBoard`, `Win32_OperatingSystem`, `Win32_Processor`, `Win32_PhysicalMemory`, `MSFT_PhysicalDisk`, `Win32_DiskDrive`, `WmiMonitorID`, `Win32_UserAccount`, Registro `ProfileList`/`CurrentVersion`, traducción de SID, `NetworkInterface`): todas responden igual. Por eso el manifiesto pasó de `requireAdministrator` a `asInvoker`. La consulta a Active Directory usa la identidad del usuario de dominio, no la elevación.
 - **Error `UnauthorizedAccessException` en raíz de unidad (`D:\`):** `Directory.GetFiles` con `SearchOption.AllDirectories` fallaba al intentar leer `D:\System Volume Information`. Se reemplazó por `GetInventoryTxtFiles()`, que solo revisa el directorio raíz (`TopDirectoryOnly`) y las subcarpetas `ADMINISTRATIVOS`, `AULAS` y `LABORATORIO`.
 - **Primer release v1.0.0 (2026-11-18):** La numeración de versiones reinicia en 1.0.0 (antes el título decía v3.1). Para la USB/SSD se distribuye un único ZIP con `InventarioTI.exe` y un `Iniciar_Inventario.bat` autónomo con el código C# embebido, generado por `Empaquetar_Release.bat`. No se fusionan `.exe` y `.bat` en un solo archivo: son formatos distintos y los archivos híbridos son marcados como sospechosos por los antivirus. El repositorio `aarneth/inventario-ti` es privado y el responsable copia el ZIP a los técnicos.
+- **Gestión de cambios (2026-11-18):** Al validar la comparación de `.txt` existente se encontraron cuatro fallas, todas corregidas:
+  - "Guardar historial" estaba invertido: archivaba el reporte NUEVO y dejaba el viejo como vigente, así que el cambio nunca llegaba al Excel.
+  - La IP y el DNS generaban falsas alarmas.
+  - No se detectaba el reporte anterior si el equipo cambiaba de área.
+  - Las ediciones de la pestaña 2 se perdían al recargar.
+  Se agregaron: edición manual en ambas pestañas (persistida como `Ajuste Manual` en el `.txt`), un comparador campo por campo con elección por fila y la comparación automática con el Excel exportado anterior al exportar. También se corrigió un error de layout por el que los botones GUARDAR y EXPORTAR quedaban fuera de la ventana.
 
 ## 3. Estructura Exacta de Columnas del Excel Maestro
 1. `TIPO` (`PC` o `LAPTOP`)
