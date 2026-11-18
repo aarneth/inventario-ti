@@ -1669,7 +1669,7 @@ namespace SistemaInventarioTI
                     correosFinal = string.Join("/", correosArr.Distinct().ToArray());
                 }
 
-                string hpInsights = marca == "HP" ? "S\u00CD" : "N/A";
+                string hpInsights = CalcHpInsights(marca);
                 string obs = marca == "LENOVO" ? "LENOVO SIN INSIGHT" : "NINGUNA";
                 if (string.Join(" ", lines).IndexOf("validar presencialmente", StringComparison.OrdinalIgnoreCase) >= 0)
                     obs = obs == "NINGUNA" ? "VALIDAR DATOS PRESENCIALMENTE" : obs + " / VALIDAR DATOS PRESENCIALMENTE";
@@ -1685,8 +1685,29 @@ namespace SistemaInventarioTI
                 tableTodos.Rows.Add(row);
             }
 
+            // Se engancha despues de la carga: solo reacciona a ediciones posteriores de MARCA
+            tableTodos.ColumnChanged += TableTodos_ColumnChanged;
+
             ApplyGridFilter();
             UpdateTxtCounterBadge();
+        }
+
+        // Regla de negocio: HP INSIGHTS = "SI" solo para equipos HP; cualquier otra marca = "NO"
+        private static string CalcHpInsights(string marca)
+        {
+            string m = (marca ?? "").Trim().ToUpperInvariant();
+            bool esHp = Regex.IsMatch(m, @"\bHP\b") || m.Contains("HEWLETT");
+            return esHp ? "S\u00CD" : "NO";
+        }
+
+        // Recalcula HP INSIGHTS cuando se edita la MARCA de cualquier fila (manual o cargada desde .txt)
+        private void TableTodos_ColumnChanged(object sender, DataColumnChangeEventArgs e)
+        {
+            if (e.Column == null || e.Column.ColumnName != "MARCA") return;
+            string nuevo = CalcHpInsights(e.ProposedValue != null ? e.ProposedValue.ToString() : "");
+            if (!string.Equals(Convert.ToString(e.Row["HP INSIGHTS"]), nuevo, StringComparison.Ordinal))
+                e.Row["HP INSIGHTS"] = nuevo;
+            if (grid != null) grid.Invalidate();
         }
 
         private void ApplyGridFilter()
@@ -1770,7 +1791,7 @@ namespace SistemaInventarioTI
             r["ORGANIZACI\u00D3N"] = cmbInst.SelectedIndex == 2 ? txtOrgW.Text.Trim().ToUpper() : "IDAC";
             r["ANTIVIRUS"] = "S\u00CD";
             r["ABSOLUTE"] = "S\u00CD";
-            r["HP INSIGHTS"] = "S\u00CD";
+            r["HP INSIGHTS"] = CalcHpInsights(Convert.ToString(r["MARCA"]));
             r["TECNICO RESPONSABLE"] = txtTec.Text.Trim().ToUpper();
             r["OBSERVACI\u00D3N"] = "NINGUNA";
             r["_CATEGORIA_INTERNA"] = cat;

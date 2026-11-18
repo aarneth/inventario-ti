@@ -28,7 +28,8 @@ Aplicación de escritorio Windows Forms escrita en **C# (.NET Framework 4.x)** p
   - `AULAS` y `LABORATORIO`: **26 columnas** (omiten `OBSERVACIÓN`).
   - Múltiples usuarios en un mismo equipo se unen con `/` en MAYÚSCULAS (`USUARIO 1/USUARIO 2`) y sus correos de AD con `/` en minúsculas (`correo1@dominio/correo2@dominio`).
   - En `LAPTOP`, las columnas `MONITOR-MODELO` y `SERIE MONITOR` quedan vacías si solo usan pantalla integrada.
-  - En `LENOVO`, `HP INSIGHTS` = `N/A` y `OBSERVACIÓN` = `LENOVO SIN INSIGHT`.
+  - En `LENOVO`, `HP INSIGHTS` = `NO` y `OBSERVACIÓN` = `LENOVO SIN INSIGHT`.
+  - `HP INSIGHTS` se calcula siempre con `CalcHpInsights()` (`SÍ` solo para HP/Hewlett, `NO` para el resto). Al editar `MARCA` en la tabla (cualquier fila, manual o desde `.txt`) se recalcula automáticamente vía `TableTodos_ColumnChanged`; `OBSERVACIÓN` **no** se modifica en ese caso (decisión del usuario).
 - **Técnicos Responsables:** Se registran en MAYÚSCULAS usando únicamente **PRIMER NOMBRE y PRIMER APELLIDO** separados por `/` (ej. `ALVARO SORIANO/AARON GONZALES`) y se persisten en `config_inventario.json`.
 
 ## Comandos de Prueba y Verificación

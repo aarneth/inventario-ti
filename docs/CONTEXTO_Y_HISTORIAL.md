@@ -40,7 +40,7 @@ El flujo operativo consta de dos fases integradas en una interfaz gráfica de do
 20. `NOMBRE Y APELLIDO DE USUARIO` (`NOMBRE 1/NOMBRE 2` o `DOCENTE`)
 21. `CORREO DE USUARIO` (`correo1@dominio/correo2@dominio`)
 22. `ABSOLUTE` (`SÍ`)
-23. `HP INSIGHTS` (`SÍ` para HP, `N/A` para otras marcas)
+23. `HP INSIGHTS` (`SÍ` para HP, `NO` para otras marcas)
 24. `CONTRATO` (vacío para edición manual)
 25. `AÑO F.` (vacío para edición manual)
 26. `TECNICO RESPONSABLE` (`PRIMER_NOMBRE PRIMER_APELLIDO/PRIMER_NOMBRE PRIMER_APELLIDO`)
