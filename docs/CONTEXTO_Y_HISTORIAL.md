@@ -23,6 +23,13 @@ El flujo operativo consta de dos fases integradas en una interfaz gráfica de do
   - No se detectaba el reporte anterior si el equipo cambiaba de área.
   - Las ediciones de la pestaña 2 se perdían al recargar.
   Se agregaron: edición manual en ambas pestañas (persistida como `Ajuste Manual` en el `.txt`), un comparador campo por campo con elección por fila y la comparación automática con el Excel exportado anterior al exportar. También se corrigió un error de layout por el que los botones GUARDAR y EXPORTAR quedaban fuera de la ventana.
+- **Detección real de Antivirus, Absolute y HP Insights (2026-11-18):** antes las tres columnas eran fijas (`SÍ`, y HP INSIGHTS por marca). Ahora el escaneo las detecta sin permisos de administrador y las guarda en el `.txt` (líneas `Antivirus`, `Absolute`, `HP Insights`, comparadas campo por campo al guardar):
+  - **Antivirus:** productos de `root\SecurityCenter2\AntiVirusProduct` con su estado (activo/inactivo); si no hay Centro de Seguridad (Windows Server), servicios de Kaspersky (sin contar el Agente de red). Columna `SÍ` solo si es Kaspersky (decisión del usuario).
+  - **Absolute:** servicios `rpcnet`, `rpcnetp`, `CTES*`, `Absolute*` o con "Absolute"/"Computrace" en el nombre, programas de Absolute Software, archivos `rpcnet(p).exe` en System32/SysWOW64 y la clave `HKLM\SOFTWARE\Absolute Software`.
+  - **HP Insights:** servicios y programas "HP Insights", "HP Touchpoint Analytics", "HP TechPulse" o "HP ... Workforce Experience" (no confundir con el servicio de Microsoft "Insights de calidad y uso").
+  - Se quitó la `OBSERVACIÓN` "LENOVO SIN INSIGHT". Reportes de versiones anteriores y filas manuales muestran `NO VERIFICADO` hasta volver a escanear el equipo.
+  - No se pudo probar en un equipo con Kaspersky, Absolute o HP Insights instalados: si en un equipo real no se detecta, revisar el nombre del servicio/programa y agregarlo a los patrones de `DetectAbsolute` / `DetectHpInsightsAgent`.
+- **Acerca de (2026-11-18):** menú `Ayuda > Acerca de...` (F1) con autor (Aaron Keneth Gonzales Cortez), año de creación 2026, agradecimiento y herramientas utilizadas.
 
 ## 3. Estructura Exacta de Columnas del Excel Maestro
 1. `TIPO` (`PC` o `LAPTOP`)
@@ -43,18 +50,17 @@ El flujo operativo consta de dos fases integradas en una interfaz gráfica de do
 16. `AULA / LAB / ADMINISTRATIVO` (`ADMINISTRATIVO` para administrativos, o el nombre del aula/laboratorio)
 17. `FECHA DE INVENTARIO` (`yyyy-MM-dd`)
 18. `ORGANIZACIÓN` (`IDAC` para Carrión, `UPNW` u otra sigla configurable para Wiener)
-19. `ANTIVIRUS` (`SÍ`)
+19. `ANTIVIRUS` (`SÍ` solo si se detecta Kaspersky; `NO` si no; `NO VERIFICADO` en reportes sin detección y filas manuales)
 20. `NOMBRE Y APELLIDO DE USUARIO` (`NOMBRE 1/NOMBRE 2` o `DOCENTE`)
 21. `CORREO DE USUARIO` (`correo1@dominio/correo2@dominio`)
-22. `ABSOLUTE` (`SÍ`)
-23. `HP INSIGHTS` (`SÍ` para HP, `NO` para otras marcas)
+22. `ABSOLUTE` (`SÍ` si se detecta el agente Absolute/Computrace; `NO` si no; `NO VERIFICADO` sin detección)
+23. `HP INSIGHTS` (en equipos HP: `SÍ`/`NO` según el agente HP Insights detectado, o `NO VERIFICADO`; otras marcas: siempre `NO`)
 24. `CONTRATO` (vacío para edición manual)
 25. `AÑO F.` (vacío para edición manual)
 26. `TECNICO RESPONSABLE` (`PRIMER_NOMBRE PRIMER_APELLIDO/PRIMER_NOMBRE PRIMER_APELLIDO`)
 27. `OBSERVACIÓN` *(Solo en pestaña ADMINISTRATIVOS y TODOS)*
 
 ## 4. Mejoras Futuras / Backlog Propuesto
-- Detección real en Windows de los servicios/agentes de **Antivirus** (`root\SecurityCenter2`), **Absolute** (`rpcnet`) y **HP Insights** en lugar de valores por defecto.
 - Importación del archivo Excel maestro descargado de la nube (`CARRION SJL.xlsx` o equivalente de Wiener) para cruzar datos y resaltar equipos nuevos vs. modificados.
 - Soporte para registrar múltiples monitores en puestos administrativos con doble pantalla.
 - Escaneo remoto en red LAN/Dominio por rango de IPs o lista de hostnames.

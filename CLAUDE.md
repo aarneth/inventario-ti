@@ -30,8 +30,12 @@ Aplicación de escritorio Windows Forms escrita en **C# (.NET Framework 4.x)** p
   - `AULAS` y `LABORATORIO`: **26 columnas** (omiten `OBSERVACIÓN`).
   - Múltiples usuarios en un mismo equipo se unen con `/` en MAYÚSCULAS (`USUARIO 1/USUARIO 2`) y sus correos de AD con `/` en minúsculas (`correo1@dominio/correo2@dominio`).
   - En `LAPTOP`, las columnas `MONITOR-MODELO` y `SERIE MONITOR` quedan vacías si solo usan pantalla integrada.
-  - En `LENOVO`, `HP INSIGHTS` = `NO` y `OBSERVACIÓN` = `LENOVO SIN INSIGHT`.
-  - `HP INSIGHTS` se calcula siempre con `CalcHpInsights()` (`SÍ` solo para HP/Hewlett, `NO` para el resto). Al editar `MARCA` en la tabla (cualquier fila, manual o desde `.txt`) se recalcula automáticamente vía `TableTodos_ColumnChanged`; `OBSERVACIÓN` **no** se modifica en ese caso (decisión del usuario).
+  - **ANTIVIRUS / ABSOLUTE / HP INSIGHTS** salen de la detección real (`ScanSecuritySoftware()`, sin admin) guardada en el `.txt` como `Antivirus`, `Absolute` y `HP Insights`:
+    - `ANTIVIRUS` = `SÍ` **solo si es Kaspersky** (`CalcAntivirusCol()`); Defender u otro = `NO`.
+    - `ABSOLUTE` = `SÍ`/`NO` según el agente (`CalcAgentCol()`).
+    - `HP INSIGHTS` se calcula siempre con `CalcHpInsights(marca, agente)`: otras marcas = `NO`; HP = `SÍ`/`NO` según el agente. Al editar `MARCA` en la tabla se recalcula vía `TableTodos_ColumnChanged` (usa `hpAgentByFile`); `OBSERVACIÓN` **no** se modifica.
+    - Reportes sin esas líneas (versiones anteriores) y filas de `+ Fila Manual` = `NO VERIFICADO`.
+  - Ya **no** existe la observación `LENOVO SIN INSIGHT` (decisión del usuario).
 - **Técnicos Responsables:** Se registran en MAYÚSCULAS usando únicamente **PRIMER NOMBRE y PRIMER APELLIDO** separados por `/` (ej. `ALVARO SORIANO/AARON GONZALES`) y se persisten en `config_inventario.json`.
 
 ## Gestión de Cambios (reemplazo de monitor, RAM, disco, CPU, equipo)

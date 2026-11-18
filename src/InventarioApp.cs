@@ -45,7 +45,8 @@ namespace SistemaInventarioTI
         public static readonly string[] FieldKeys = new string[] {
             "Categoria Ubicacion", "Area / Ambiente", "Piso Ubicacion", "Seguridad Fisica",
             "Tipo de Equipo", "Marca", "Modelo", "Serie del Equipo", "Hostname", "Dominio / Grupo",
-            "Sistema Operativo", "Procesador", "Memoria RAM", "Almacenamiento"
+            "Sistema Operativo", "Procesador", "Memoria RAM", "Almacenamiento",
+            "Antivirus", "Absolute", "HP Insights"
         };
 
         public Dictionary<string, string> Fields = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -133,6 +134,12 @@ namespace SistemaInventarioTI
         // Pestana 2, por ruta de .txt: valores calculados del escaneo (sin ajustes) y valores tal como se cargaron
         private Dictionary<string, string[]> calcByFile = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
         private Dictionary<string, string[]> loadedByFile = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
+        // Pestana 2, por ruta de .txt: resultado de la deteccion del agente HP Insights (para recalcular al editar MARCA)
+        private Dictionary<string, string> hpAgentByFile = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        // Pestana 1: resultado de la deteccion de software de seguridad del equipo escaneado o del reporte abierto
+        private string secAntivirus = "";
+        private string secAbsolute = "";
+        private string secHpInsights = "";
 
         private Label lblHeaderStats;
         private ToolStripStatusLabel lblStatusText;
@@ -354,8 +361,9 @@ namespace SistemaInventarioTI
             // La version mostrada sale de AssemblyVersion (unica fuente; ver Empaquetar_Release.bat)
             Version ver = Assembly.GetExecutingAssembly().GetName().Version;
             this.Text = string.Format("Sistema de Inventario y Auditor\u00EDa TI v{0}.{1}.{2} (C# Nativo) - Wiener / Carri\u00F3n", ver.Major, ver.Minor, ver.Build);
-            this.Size = new Size(1180, 790);
-            this.MinimumSize = new Size(1050, 700);
+            // +24 px de alto por la barra de menu, para que las pestanas conserven su tamano de diseno (1156x650)
+            this.Size = new Size(1180, 814);
+            this.MinimumSize = new Size(1050, 724);
             this.StartPosition = FormStartPosition.CenterScreen;
             this.Font = new Font("Segoe UI", 9F, FontStyle.Regular);
             this.BackColor = Color.FromArgb(241, 245, 249);
@@ -422,9 +430,21 @@ namespace SistemaInventarioTI
             tabs.TabPages.Add(tabScan);
             tabs.TabPages.Add(tabExcel);
 
+            MenuStrip menu = new MenuStrip();
+            menu.BackColor = Color.FromArgb(226, 232, 240);
+            ToolStripMenuItem mnuAyuda = new ToolStripMenuItem("Ayuda");
+            ToolStripMenuItem mnuAcerca = new ToolStripMenuItem("Acerca de...");
+            mnuAcerca.ShortcutKeys = Keys.F1;
+            mnuAcerca.Click += delegate { ShowAboutDialog(); };
+            mnuAyuda.DropDownItems.Add(mnuAcerca);
+            menu.Items.Add(mnuAyuda);
+
             this.Controls.Add(tabs);
             this.Controls.Add(pnlHeader);
             this.Controls.Add(statusStrip);
+            // Se agrega al final para que quede arriba de la cabecera
+            this.Controls.Add(menu);
+            this.MainMenuStrip = menu;
 
             tabs.SelectedIndexChanged += delegate {
                 if (tabs.SelectedIndex == 1) LoadTxtFilesIntoTable();
@@ -1077,6 +1097,9 @@ namespace SistemaInventarioTI
                 List<string> userLines = ScanUserProfiles(csName);
                 activeNets = ScanActiveNetworks();
                 List<string> monLines = ScanMonitorsEdid();
+                lblStatusText.Text = "Detectando antivirus, Absolute y HP Insights...";
+                Application.DoEvents();
+                ScanSecuritySoftware(out secAntivirus, out secAbsolute, out secHpInsights);
 
                 string hostUpper = csName.ToUpper();
                 bool esLaptop = Regex.IsMatch(hostUpper, @"^[A-Z]+\d+LP") ||
@@ -1349,6 +1372,309 @@ namespace SistemaInventarioTI
             return mons;
         }
 
+        // ===================== Ayuda > Acerca de =====================
+
+        private void ShowAboutDialog()
+        {
+            Version ver = Assembly.GetExecutingAssembly().GetName().Version;
+            using (Form dlg = new Form())
+            {
+                dlg.Text = "Acerca de";
+                dlg.FormBorderStyle = FormBorderStyle.FixedDialog;
+                dlg.MaximizeBox = false;
+                dlg.MinimizeBox = false;
+                dlg.ShowInTaskbar = false;
+                dlg.StartPosition = FormStartPosition.CenterParent;
+                dlg.ClientSize = new Size(520, 470);
+                dlg.BackColor = Color.White;
+                dlg.Font = new Font("Segoe UI", 9.5F);
+                if (this.Icon != null) dlg.Icon = this.Icon;
+
+                Panel head = new Panel();
+                head.Dock = DockStyle.Top;
+                head.Height = 78;
+                head.BackColor = Color.FromArgb(15, 23, 42);
+                Label t1 = new Label();
+                t1.Text = "Sistema de Inventario y Auditor\u00EDa TI";
+                t1.Font = new Font("Segoe UI", 14F, FontStyle.Bold);
+                t1.ForeColor = Color.White;
+                t1.AutoSize = true;
+                t1.Location = new Point(20, 12);
+                head.Controls.Add(t1);
+                Label t2 = new Label();
+                t2.Text = string.Format("Versi\u00F3n {0}.{1}.{2}  \u2022  Universidad Norbert Wiener  |  Instituto Carri\u00F3n", ver.Major, ver.Minor, ver.Build);
+                t2.ForeColor = Color.FromArgb(148, 163, 184);
+                t2.AutoSize = true;
+                t2.Location = new Point(22, 46);
+                head.Controls.Add(t2);
+
+                Label lblAutor = new Label();
+                lblAutor.Text = "Creado por";
+                lblAutor.ForeColor = Color.FromArgb(100, 116, 139);
+                lblAutor.AutoSize = true;
+                lblAutor.Location = new Point(22, 96);
+                Label lblNombre = new Label();
+                lblNombre.Text = "Aaron Keneth Gonzales Cortez";
+                lblNombre.Font = new Font("Segoe UI", 12F, FontStyle.Bold);
+                lblNombre.ForeColor = Color.FromArgb(15, 23, 42);
+                lblNombre.AutoSize = true;
+                lblNombre.Location = new Point(20, 116);
+                Label lblAnio = new Label();
+                lblAnio.Text = "A\u00F1o de creaci\u00F3n: 2026";
+                lblAnio.AutoSize = true;
+                lblAnio.Location = new Point(22, 146);
+
+                Label lblGracias = new Label();
+                lblGracias.Text = "\u00A1Gracias por usar este programa! Tu trabajo ayuda a mantener actualizado y confiable " +
+                    "el inventario de equipos de c\u00F3mputo de la Universidad Norbert Wiener y del Instituto Carri\u00F3n.";
+                lblGracias.ForeColor = Color.FromArgb(30, 64, 175);
+                lblGracias.BackColor = Color.FromArgb(239, 246, 255);
+                lblGracias.Padding = new Padding(10, 8, 10, 8);
+                lblGracias.Location = new Point(20, 178);
+                lblGracias.Size = new Size(480, 76);
+
+                Label lblHerr = new Label();
+                lblHerr.Text = "Herramientas utilizadas";
+                lblHerr.Font = new Font("Segoe UI", 9.5F, FontStyle.Bold);
+                lblHerr.AutoSize = true;
+                lblHerr.Location = new Point(20, 268);
+                Label lblLista = new Label();
+                lblLista.Text =
+                    "\u2022  C# 5, .NET Framework 4.x y Windows Forms\n" +
+                    "\u2022  WMI / CIM, Registro de Windows, Active Directory (LDAP)\n" +
+                    "   y Open XML (Excel sin Microsoft Office)\n" +
+                    "\u2022  Claude Code (asistente de programaci\u00F3n con IA de Anthropic)\n" +
+                    "\u2022  Git y GitHub (control de versiones y publicaci\u00F3n)";
+                lblLista.Location = new Point(22, 292);
+                lblLista.Size = new Size(480, 100);
+
+                Label lblCopy = new Label();
+                lblCopy.Text = "\u00A9 2026 Aaron Keneth Gonzales Cortez";
+                lblCopy.ForeColor = Color.FromArgb(100, 116, 139);
+                lblCopy.AutoSize = true;
+                lblCopy.Location = new Point(22, 432);
+
+                Button btn = new Button();
+                btn.Text = "Cerrar";
+                btn.DialogResult = DialogResult.OK;
+                btn.Size = new Size(100, 30);
+                btn.Location = new Point(400, 424);
+                dlg.AcceptButton = btn;
+                dlg.CancelButton = btn;
+
+                dlg.Controls.AddRange(new Control[] { head, lblAutor, lblNombre, lblAnio, lblGracias, lblHerr, lblLista, lblCopy, btn });
+                dlg.ShowDialog(this);
+            }
+        }
+
+        // ===================== Deteccion de software de seguridad (Antivirus, Absolute, HP Insights) =====================
+        // Todo funciona como usuario estandar: Centro de Seguridad de Windows (root\SecurityCenter2),
+        // servicios (Win32_Service), programas instalados (Registro Uninstall) y archivos del sistema.
+
+        private const string SEC_DETECTADO = "Detectado: ";
+        private const string SEC_NO_DETECTADO = "No detectado";
+
+        private void ScanSecuritySoftware(out string antivirus, out string absolute, out string hpInsights)
+        {
+            List<string[]> services = GetServicesList();
+            List<string[]> programs = GetInstalledPrograms();
+            antivirus = DetectAntivirus(services);
+            absolute = DetectAbsolute(services, programs);
+            hpInsights = DetectHpInsightsAgent(services, programs);
+        }
+
+        // [Nombre, Nombre para mostrar]
+        private static List<string[]> GetServicesList()
+        {
+            List<string[]> res = new List<string[]>();
+            try
+            {
+                using (ManagementObjectSearcher s = new ManagementObjectSearcher("SELECT Name, DisplayName FROM Win32_Service"))
+                {
+                    foreach (ManagementObject mo in s.Get())
+                    {
+                        string n = mo["Name"] != null ? mo["Name"].ToString().Trim() : "";
+                        string d = mo["DisplayName"] != null ? mo["DisplayName"].ToString().Trim() : "";
+                        if (n.Length > 0) res.Add(new string[] { n, d });
+                    }
+                }
+            }
+            catch { }
+            return res;
+        }
+
+        // [Nombre del programa, Fabricante] desde las claves Uninstall (64 y 32 bits, equipo y usuario)
+        private static List<string[]> GetInstalledPrograms()
+        {
+            List<string[]> res = new List<string[]>();
+            const string UNINST = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
+            List<RegistryKey> roots = new List<RegistryKey>();
+            try { roots.Add(RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64)); } catch { }
+            try { roots.Add(RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry32)); } catch { }
+            try { roots.Add(RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, RegistryView.Default)); } catch { }
+            foreach (RegistryKey root in roots)
+            {
+                try
+                {
+                    using (RegistryKey uk = root.OpenSubKey(UNINST))
+                    {
+                        if (uk == null) continue;
+                        foreach (string sub in uk.GetSubKeyNames())
+                        {
+                            try
+                            {
+                                using (RegistryKey pk = uk.OpenSubKey(sub))
+                                {
+                                    if (pk == null) continue;
+                                    object dn = pk.GetValue("DisplayName");
+                                    if (dn == null || dn.ToString().Trim().Length == 0) continue;
+                                    object pb = pk.GetValue("Publisher");
+                                    res.Add(new string[] { dn.ToString().Trim(), pb != null ? pb.ToString().Trim() : "" });
+                                }
+                            }
+                            catch { }
+                        }
+                    }
+                }
+                catch { }
+                finally { root.Close(); }
+            }
+            return res;
+        }
+
+        private static void AddEvidence(List<string> list, string item)
+        {
+            foreach (string x in list)
+                if (string.Equals(x, item, StringComparison.OrdinalIgnoreCase)) return;
+            list.Add(item);
+        }
+
+        private static string EvidenceResult(List<string> ev)
+        {
+            if (ev.Count == 0) return SEC_NO_DETECTADO;
+            return SEC_DETECTADO + string.Join("; ", ev.Take(4).ToArray());
+        }
+
+        // Productos registrados en el Centro de Seguridad de Windows. Si no esta disponible (Windows Server)
+        // se buscan los servicios de Kaspersky.
+        private static string DetectAntivirus(List<string[]> services)
+        {
+            List<string> prods = new List<string>();
+            bool consultado = false;
+            try
+            {
+                ManagementScope scope = new ManagementScope(@"\\.\root\SecurityCenter2");
+                scope.Connect();
+                using (ManagementObjectSearcher s = new ManagementObjectSearcher(scope, new ObjectQuery("SELECT displayName, productState FROM AntiVirusProduct")))
+                {
+                    foreach (ManagementObject mo in s.Get())
+                    {
+                        string name = mo["displayName"] != null ? mo["displayName"].ToString().Trim() : "";
+                        if (name.Length == 0) continue;
+                        uint state = 0;
+                        if (mo["productState"] != null) uint.TryParse(mo["productState"].ToString(), out state);
+                        // Bits 12-15 de productState: 1 = proteccion en tiempo real activa
+                        string estado = ((state >> 12) & 0xF) == 1 ? "activo" : "inactivo";
+                        AddEvidence(prods, string.Format("{0} ({1})", name, estado));
+                    }
+                }
+                consultado = true;
+            }
+            catch { }
+
+            bool hayKaspersky = prods.Any(p => p.IndexOf("Kaspersky", StringComparison.OrdinalIgnoreCase) >= 0);
+            if (!hayKaspersky)
+            {
+                foreach (string[] sv in services)
+                {
+                    string d = sv[1];
+                    if (d.IndexOf("Kaspersky", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    // El Agente de red (klnagent) es la consola de administracion, no el antivirus
+                    if (Regex.IsMatch(d, @"Network Agent|Agente de red", RegexOptions.IgnoreCase)) continue;
+                    AddEvidence(prods, string.Format("{0} (servicio)", d));
+                    break;
+                }
+            }
+
+            if (prods.Count > 0) return string.Join(" / ", prods.ToArray());
+            return consultado ? "No se detecto antivirus" : "No se pudo consultar el antivirus (validar presencialmente)";
+        }
+
+        private static string DetectAbsolute(List<string[]> services, List<string[]> programs)
+        {
+            List<string> ev = new List<string>();
+            foreach (string[] sv in services)
+            {
+                if (Regex.IsMatch(sv[0], @"^(rpcnet|rpcnetp|ctes.*|absolute.*)$", RegexOptions.IgnoreCase) ||
+                    Regex.IsMatch(sv[1], @"\bAbsolute\b|Computrace", RegexOptions.IgnoreCase))
+                    AddEvidence(ev, "servicio " + (sv[1].Length > 0 ? sv[1] : sv[0]));
+            }
+            foreach (string[] p in programs)
+            {
+                if (Regex.IsMatch(p[1], @"Absolute Software", RegexOptions.IgnoreCase) ||
+                    Regex.IsMatch(p[0], @"^Absolute\b|Computrace", RegexOptions.IgnoreCase))
+                    AddEvidence(ev, "programa " + p[0]);
+            }
+            try
+            {
+                string win = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+                foreach (string f in new string[] { @"System32\rpcnet.exe", @"System32\rpcnetp.exe", @"SysWOW64\rpcnet.exe", @"SysWOW64\rpcnetp.exe" })
+                {
+                    if (File.Exists(Path.Combine(win, f))) AddEvidence(ev, "archivo " + Path.GetFileName(f));
+                }
+            }
+            catch { }
+            try
+            {
+                foreach (RegistryView view in new RegistryView[] { RegistryView.Registry64, RegistryView.Registry32 })
+                {
+                    using (RegistryKey lm = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, view))
+                    using (RegistryKey k = lm.OpenSubKey(@"SOFTWARE\Absolute Software"))
+                    {
+                        if (k != null) AddEvidence(ev, "registro Absolute Software");
+                    }
+                }
+            }
+            catch { }
+            return EvidenceResult(ev);
+        }
+
+        private static string DetectHpInsightsAgent(List<string[]> services, List<string[]> programs)
+        {
+            const string PATRON = @"^HP\s+(Insights|Touchpoint\s+Analytics|TechPulse)|^HP\b.*Workforce\s+Experience";
+            List<string> ev = new List<string>();
+            foreach (string[] sv in services)
+            {
+                if (Regex.IsMatch(sv[1], PATRON, RegexOptions.IgnoreCase) ||
+                    Regex.IsMatch(sv[0], @"^(HpTouchpointAnalyticsService|HPInsights.*|HPTechPulse.*)$", RegexOptions.IgnoreCase))
+                    AddEvidence(ev, "servicio " + (sv[1].Length > 0 ? sv[1] : sv[0]));
+            }
+            foreach (string[] p in programs)
+            {
+                if (Regex.IsMatch(p[0], PATRON, RegexOptions.IgnoreCase))
+                    AddEvidence(ev, "programa " + p[0]);
+            }
+            return EvidenceResult(ev);
+        }
+
+        // Valores de las columnas del Excel a partir de lo guardado en el .txt.
+        // Campo vacio = reporte generado antes de la v1.2.0 (sin deteccion) => "NO VERIFICADO".
+        private const string NO_VERIFICADO = "NO VERIFICADO";
+
+        private static string CalcAntivirusCol(string detectado)
+        {
+            string d = (detectado ?? "").Trim();
+            if (d.Length == 0 || d.IndexOf("validar", StringComparison.OrdinalIgnoreCase) >= 0) return NO_VERIFICADO;
+            return d.IndexOf("Kaspersky", StringComparison.OrdinalIgnoreCase) >= 0 ? "S\u00CD" : "NO";
+        }
+
+        private static string CalcAgentCol(string detectado)
+        {
+            string d = (detectado ?? "").Trim();
+            if (d.Length == 0) return NO_VERIFICADO;
+            return d.StartsWith(SEC_DETECTADO.Trim(), StringComparison.OrdinalIgnoreCase) ? "S\u00CD" : "NO";
+        }
+
         // ===================== Modelo del reporte .txt (lectura / escritura) =====================
 
         private static string RptLine(string label, string value)
@@ -1389,6 +1715,9 @@ namespace SistemaInventarioTI
             r.Set("Procesador", txtCPU != null ? txtCPU.Text.Trim() : "");
             r.Set("Memoria RAM", txtRAM != null ? txtRAM.Text.Trim() : "");
             r.Set("Almacenamiento", txtDisk != null ? txtDisk.Text.Trim() : "");
+            r.Set("Antivirus", secAntivirus);
+            r.Set("Absolute", secAbsolute);
+            r.Set("HP Insights", secHpInsights);
 
             r.Users.AddRange(SplitLines(txtUsers != null ? txtUsers.Text : ""));
             foreach (NetAdapterInfo n in activeNets) r.Nets.Add(InventoryReport.CloneNet(n));
@@ -1555,6 +1884,9 @@ namespace SistemaInventarioTI
                 txtCPU.Text = r.Get("Procesador");
                 txtRAM.Text = r.Get("Memoria RAM");
                 txtDisk.Text = r.Get("Almacenamiento");
+                secAntivirus = r.Get("Antivirus");
+                secAbsolute = r.Get("Absolute");
+                secHpInsights = r.Get("HP Insights");
                 txtUsers.Text = string.Join(Environment.NewLine, r.Users.ToArray());
                 txtMons.Text = string.Join(Environment.NewLine, r.Monitors.ToArray());
                 activeNets = new List<NetAdapterInfo>();
@@ -2016,6 +2348,7 @@ namespace SistemaInventarioTI
             tableTodos.Columns.Add("_ARCHIVO");
             calcByFile = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
             loadedByFile = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
+            hpAgentByFile = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
             List<FileInfo> candidateFiles = GetInventoryTxtFiles();
             List<FileInfo> validFiles = new List<FileInfo>();
@@ -2228,8 +2561,12 @@ namespace SistemaInventarioTI
                     correosFinal = string.Join("/", correosArr.Distinct().ToArray());
                 }
 
-                string hpInsights = CalcHpInsights(marca);
-                string obs = marca == "LENOVO" ? "LENOVO SIN INSIGHT" : "NINGUNA";
+                string agenteHp = data.ContainsKey("HP Insights") ? data["HP Insights"] : "";
+                hpAgentByFile[file.FullName] = agenteHp;
+                string hpInsights = CalcHpInsights(marca, agenteHp);
+                string antivirusCol = CalcAntivirusCol(data.ContainsKey("Antivirus") ? data["Antivirus"] : "");
+                string absoluteCol = CalcAgentCol(data.ContainsKey("Absolute") ? data["Absolute"] : "");
+                string obs = "NINGUNA";
                 if (string.Join(" ", lines).IndexOf("validar presencialmente", StringComparison.OrdinalIgnoreCase) >= 0)
                     obs = obs == "NINGUNA" ? "VALIDAR DATOS PRESENCIALMENTE" : obs + " / VALIDAR DATOS PRESENCIALMENTE";
 
@@ -2237,7 +2574,7 @@ namespace SistemaInventarioTI
                 object[] vals = new object[] {
                     tipo, piso, "OPERATIVO", marca, modelo, serie, cpu, ram, discoDuro,
                     macPrincipal, hostName, monModelo, monSerie, area, remachado, aulaLabAdm,
-                    fechaInv, orgActual, "S\u00CD", usuariosFinal, correosFinal, "S\u00CD", hpInsights,
+                    fechaInv, orgActual, antivirusCol, usuariosFinal, correosFinal, absoluteCol, hpInsights,
                     "", "", tecnicosResponsables, obs, pestanaDestino, file.FullName
                 };
 
@@ -2257,7 +2594,7 @@ namespace SistemaInventarioTI
                     if (ci == ColIdx("HP INSIGHTS")) ajHp = true;
                 }
                 if (ajMarca && !ajHp)
-                    vals[ColIdx("HP INSIGHTS")] = CalcHpInsights(Convert.ToString(vals[ColIdx("MARCA")]));
+                    vals[ColIdx("HP INSIGHTS")] = CalcHpInsights(Convert.ToString(vals[ColIdx("MARCA")]), agenteHp);
 
                 string[] loaded = new string[headersAdm.Length];
                 for (int ci = 0; ci < headersAdm.Length; ci++) loaded[ci] = Convert.ToString(vals[ci]);
@@ -2275,19 +2612,29 @@ namespace SistemaInventarioTI
             UpdateTxtCounterBadge();
         }
 
-        // Regla de negocio: HP INSIGHTS = "SI" solo para equipos HP; cualquier otra marca = "NO"
-        private static string CalcHpInsights(string marca)
+        // Regla de negocio: otras marcas = "NO"; en equipos HP depende del agente HP Insights detectado
+        // ("SI" / "NO", o "NO VERIFICADO" si el reporte no tiene deteccion o es una fila manual).
+        private static string CalcHpInsights(string marca, string agenteDetectado)
         {
             string m = (marca ?? "").Trim().ToUpperInvariant();
             bool esHp = Regex.IsMatch(m, @"\bHP\b") || m.Contains("HEWLETT");
-            return esHp ? "S\u00CD" : "NO";
+            if (!esHp) return "NO";
+            return CalcAgentCol(agenteDetectado);
+        }
+
+        private string HpAgentForRow(DataRow row)
+        {
+            string path = Convert.ToString(row["_ARCHIVO"]);
+            string ag;
+            if (!string.IsNullOrEmpty(path) && hpAgentByFile.TryGetValue(path, out ag)) return ag;
+            return "";
         }
 
         // Recalcula HP INSIGHTS cuando se edita la MARCA de cualquier fila (manual o cargada desde .txt)
         private void TableTodos_ColumnChanged(object sender, DataColumnChangeEventArgs e)
         {
             if (e.Column == null || e.Column.ColumnName != "MARCA") return;
-            string nuevo = CalcHpInsights(e.ProposedValue != null ? e.ProposedValue.ToString() : "");
+            string nuevo = CalcHpInsights(e.ProposedValue != null ? e.ProposedValue.ToString() : "", HpAgentForRow(e.Row));
             if (!string.Equals(Convert.ToString(e.Row["HP INSIGHTS"]), nuevo, StringComparison.Ordinal))
                 e.Row["HP INSIGHTS"] = nuevo;
             if (grid != null) grid.Invalidate();
@@ -2378,9 +2725,10 @@ namespace SistemaInventarioTI
             r["AULA / LAB / ADMINISTRATIVO"] = cat == "ADMINISTRATIVOS" ? "ADMINISTRATIVO" : cat;
             r["FECHA DE INVENTARIO"] = DateTime.Now.ToString("yyyy-MM-dd");
             r["ORGANIZACI\u00D3N"] = cmbInst.SelectedIndex == 2 ? txtOrgW.Text.Trim().ToUpper() : "IDAC";
-            r["ANTIVIRUS"] = "S\u00CD";
-            r["ABSOLUTE"] = "S\u00CD";
-            r["HP INSIGHTS"] = CalcHpInsights(Convert.ToString(r["MARCA"]));
+            // Fila sin escaneo: el tecnico completa estos valores a mano si los conoce
+            r["ANTIVIRUS"] = NO_VERIFICADO;
+            r["ABSOLUTE"] = NO_VERIFICADO;
+            r["HP INSIGHTS"] = CalcHpInsights(Convert.ToString(r["MARCA"]), "");
             r["TECNICO RESPONSABLE"] = txtTec.Text.Trim().ToUpper();
             r["OBSERVACI\u00D3N"] = "NINGUNA";
             r["_CATEGORIA_INTERNA"] = cat;
