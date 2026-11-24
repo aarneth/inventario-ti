@@ -29,6 +29,7 @@ Aplicación de escritorio Windows Forms escrita en **C# (.NET Framework 4.x)** p
   - `ADMINISTRATIVOS`: **27 columnas** (incluye `OBSERVACIÓN` al final).
   - `AULAS` y `LABORATORIO`: **26 columnas** (omiten `OBSERVACIÓN`).
   - Múltiples usuarios en un mismo equipo se unen con `/` en MAYÚSCULAS (`USUARIO 1/USUARIO 2`) y sus correos de AD con `/` en minúsculas (`correo1@dominio/correo2@dominio`).
+  - **Tipo de equipo:** solo `PC` o `LAPTOP` (en el `.txt`, la pestaña 1 y el Excel), calculado con `NormalizeTipoEquipo()`: `LAPTOP` si el hostname tiene `LP` o el chasis es portátil (Laptop/Notebook/Convertible/Tablet); todo lo demás (torre, Mini PC, All-in-One, no identificado) = `PC`.
   - En `LAPTOP`, las columnas `MONITOR-MODELO` y `SERIE MONITOR` quedan vacías si solo usan pantalla integrada.
   - **ANTIVIRUS / ABSOLUTE / HP INSIGHTS** salen de la detección real (`ScanSecuritySoftware()`, sin admin) guardada en el `.txt` como `Antivirus`, `Absolute` y `HP Insights`:
     - `ANTIVIRUS` = `SÍ` **solo si es Kaspersky** (`CalcAntivirusCol()`); Defender u otro = `NO`.

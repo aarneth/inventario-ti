@@ -1102,8 +1102,8 @@ namespace SistemaInventarioTI
                 ScanSecuritySoftware(out secAntivirus, out secAbsolute, out secHpInsights);
 
                 string hostUpper = csName.ToUpper();
-                bool esLaptop = Regex.IsMatch(hostUpper, @"^[A-Z]+\d+LP") ||
-                                Regex.IsMatch(tipoEquipo, @"Laptop|Portatil|Notebook|Convertible", RegexOptions.IgnoreCase);
+                string tipoFinal = NormalizeTipoEquipo(tipoEquipo, hostUpper);
+                bool esLaptop = tipoFinal == "LAPTOP";
 
                 Match mAu = Regex.Match(hostUpper, @"^[A-Z]+\d+(?:PC|LP)AU(\d{3})(\d*)$");
                 Match mLb = Regex.Match(hostUpper, @"^[A-Z]+\d+(?:PC|LP)LB(\d{3})(\d*)$");
@@ -1152,7 +1152,7 @@ namespace SistemaInventarioTI
                     cmbSeg.Text = esLaptop ? "CADENA DE SEGURIDAD" : "SIN REMACHE/SIN CADENA";
                 }
 
-                txtTipo.Text   = tipoEquipo;
+                txtTipo.Text   = tipoFinal;
                 txtMarca.Text  = marca;
                 txtModelo.Text = modelo;
                 txtSerie.Text  = serieEquipo;
@@ -1675,6 +1675,17 @@ namespace SistemaInventarioTI
             return d.StartsWith(SEC_DETECTADO.Trim(), StringComparison.OrdinalIgnoreCase) ? "S\u00CD" : "NO";
         }
 
+        // Tipo de equipo: solo "PC" o "LAPTOP". LAPTOP si el hostname es [W|C][Sede]LP... o el chasis es portatil;
+        // todo lo demas (torre, mini PC, all-in-one, chasis no identificado...) = PC.
+        private static string NormalizeTipoEquipo(string tipoRaw, string hostName)
+        {
+            string h = (hostName ?? "").Trim().ToUpperInvariant();
+            if (Regex.IsMatch(h, @"^[A-Z]+\d+LP")) return "LAPTOP";
+            if (Regex.IsMatch(tipoRaw ?? "", @"Laptop|Portatil|Notebook|Convertible|Tablet|Desmontable|Handheld", RegexOptions.IgnoreCase))
+                return "LAPTOP";
+            return "PC";
+        }
+
         // ===================== Modelo del reporte .txt (lectura / escritura) =====================
 
         private static string RptLine(string label, string value)
@@ -1874,7 +1885,8 @@ namespace SistemaInventarioTI
                 cmbArea.Text = r.Get("Area / Ambiente");
                 txtPiso.Text = r.Get("Piso Ubicacion");
                 cmbSeg.Text = r.Get("Seguridad Fisica");
-                txtTipo.Text = r.Get("Tipo de Equipo");
+                // Reportes antiguos guardaban el chasis ("Mini PC", "Notebook"...): se muestra ya como PC / LAPTOP
+                txtTipo.Text = NormalizeTipoEquipo(r.Get("Tipo de Equipo"), r.Get("Hostname"));
                 txtMarca.Text = r.Get("Marca");
                 txtModelo.Text = r.Get("Modelo");
                 txtSerie.Text = r.Get("Serie del Equipo");
@@ -2411,8 +2423,7 @@ namespace SistemaInventarioTI
                 else orgActual = hostName.StartsWith("W", StringComparison.OrdinalIgnoreCase) ? orgWienerGuardada : "IDAC";
 
                 string tipoRaw = data.ContainsKey("Tipo de Equipo") ? data["Tipo de Equipo"] : "";
-                string tipo = (Regex.IsMatch(hostName, @"^[A-Z]+\d+LP") || Regex.IsMatch(tipoRaw, @"Laptop|Portatil|Notebook|Convertible", RegexOptions.IgnoreCase))
-                    ? "LAPTOP" : "PC";
+                string tipo = NormalizeTipoEquipo(tipoRaw, hostName);
 
                 string pestanaDestino = data.ContainsKey("Categoria Ubicacion") ? data["Categoria Ubicacion"].ToUpper() : "ADMINISTRATIVOS";
                 string piso = data.ContainsKey("Piso Ubicacion") ? data["Piso Ubicacion"] : "";
