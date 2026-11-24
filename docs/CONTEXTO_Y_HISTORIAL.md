@@ -31,6 +31,10 @@ El flujo operativo consta de dos fases integradas en una interfaz gráfica de do
   - No se pudo probar en un equipo con Kaspersky, Absolute o HP Insights instalados: si en un equipo real no se detecta, revisar el nombre del servicio/programa y agregarlo a los patrones de `DetectAbsolute` / `DetectHpInsightsAgent`.
 - **Acerca de (2026-11-18):** menú `Ayuda > Acerca de...` (F1) con autor (Aaron Keneth Gonzales Cortez), año de creación 2026, agradecimiento y herramientas utilizadas.
 - **Tipo de equipo PC / LAPTOP (2026-11-24):** el escaneo guardaba el tipo de chasis ("Mini PC", "Notebook", "Desktop / Torre"...). Ahora el `.txt` y la pestaña 1 muestran solo `PC` o `LAPTOP`, con la misma regla que ya usaba el Excel (`NormalizeTipoEquipo()`). Al abrir un reporte antiguo, el tipo se convierte al cargarlo.
+- **Actualización automática (2026-11-24):** menú `Ayuda > Buscar actualizaciones ahora` y `Buscar actualizaciones al iniciar` (activada por defecto). Avisa con las novedades y el técnico confirma ("Actualizar ahora" / "Ahora no"). Decisiones del usuario:
+  - El repo `aarneth/inventario-ti` pasó a **público** (un repo privado exigiría meter un token en el `.exe`). Se revisó todo el historial antes: sin contraseñas, tokens ni datos del inventario.
+  - Kaspersky: se publica normal; si el `.exe` nuevo queda bloqueado hasta que Seguridad TI apruebe el hash, el técnico usa `Iniciar_Inventario.bat` (el programa lo indica si no puede abrir el `.exe`).
+  - Probado de punta a punta en ambos modos (`.exe` y `.bat`): una copia v1.2.0 encontró el release v1.2.1, lo instaló y se reabrió como v1.2.1, sin tocar reportes ni configuración.
 
 ## 3. Estructura Exacta de Columnas del Excel Maestro
 1. `TIPO` (`PC` o `LAPTOP`)

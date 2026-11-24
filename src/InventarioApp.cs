@@ -8,6 +8,7 @@ using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Management;
+using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Reflection;
@@ -16,6 +17,7 @@ using System.Security;
 using System.Security.Principal;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
 using System.Xml;
@@ -116,6 +118,8 @@ namespace SistemaInventarioTI
         public string OrgWiener { get; set; }
         public Dictionary<string, string> Areas { get; set; }
         public Dictionary<string, string> Pisos { get; set; }
+        // null (configuracion de versiones anteriores) = activado
+        public bool? BuscarActualizaciones { get; set; }
     }
 
     public class MainForm : Form
@@ -140,6 +144,9 @@ namespace SistemaInventarioTI
         private string secAntivirus = "";
         private string secAbsolute = "";
         private string secHpInsights = "";
+        // Actualizaciones automaticas (ver region "Actualizaciones")
+        private bool buscarActualizaciones = true;
+        private bool cerrandoPorActualizacion = false;
 
         private Label lblHeaderStats;
         private ToolStripStatusLabel lblStatusText;
@@ -334,6 +341,7 @@ namespace SistemaInventarioTI
                         foreach (KeyValuePair<string, string> kv in cfg.Pisos)
                             pisosMap[kv.Key.ToUpper()] = kv.Value.ToUpper();
                     }
+                    if (cfg.BuscarActualizaciones.HasValue) buscarActualizaciones = cfg.BuscarActualizaciones.Value;
                 }
             }
             catch { }
@@ -348,6 +356,7 @@ namespace SistemaInventarioTI
                 cfg.OrgWiener = orgWienerGuardada;
                 cfg.Areas = areaMap;
                 cfg.Pisos = pisosMap;
+                cfg.BuscarActualizaciones = buscarActualizaciones;
 
                 JavaScriptSerializer ser = new JavaScriptSerializer();
                 string json = ser.Serialize(cfg);
@@ -436,6 +445,18 @@ namespace SistemaInventarioTI
             ToolStripMenuItem mnuAcerca = new ToolStripMenuItem("Acerca de...");
             mnuAcerca.ShortcutKeys = Keys.F1;
             mnuAcerca.Click += delegate { ShowAboutDialog(); };
+            ToolStripMenuItem mnuAutoUpd = new ToolStripMenuItem("Buscar actualizaciones al iniciar");
+            mnuAutoUpd.CheckOnClick = true;
+            mnuAutoUpd.Checked = buscarActualizaciones;
+            mnuAutoUpd.CheckedChanged += delegate {
+                buscarActualizaciones = mnuAutoUpd.Checked;
+                SaveConfig();
+            };
+            ToolStripMenuItem mnuUpdNow = new ToolStripMenuItem("Buscar actualizaciones ahora");
+            mnuUpdNow.Click += delegate { CheckForUpdatesManual(); };
+            mnuAyuda.DropDownItems.Add(mnuUpdNow);
+            mnuAyuda.DropDownItems.Add(mnuAutoUpd);
+            mnuAyuda.DropDownItems.Add(new ToolStripSeparator());
             mnuAyuda.DropDownItems.Add(mnuAcerca);
             menu.Items.Add(mnuAyuda);
 
@@ -451,11 +472,14 @@ namespace SistemaInventarioTI
             };
 
             this.Shown += delegate {
+                CleanupAfterUpdate();
                 ScanCurrentHardware();
                 UpdateTxtCounterBadge();
+                if (buscarActualizaciones) CheckForUpdatesInBackground();
             };
 
             this.FormClosing += delegate(object s, FormClosingEventArgs ev) {
+                if (cerrandoPorActualizacion) return;
                 if (!ConfirmSaveOrDiscardGridChanges()) ev.Cancel = true;
             };
         }
@@ -1370,6 +1394,445 @@ namespace SistemaInventarioTI
             }
             catch { }
             return mons;
+        }
+
+        // ===================== Actualizaciones (releases publicos de GitHub) =====================
+        // Consulta el ultimo release del repo publico (sin token). Si hay una version mayor muestra las novedades y,
+        // si el tecnico acepta, descarga el ZIP del release, verifica su SHA-256 (el "digest" que publica GitHub),
+        // reemplaza InventarioTI.exe e Iniciar_Inventario.bat en la carpeta del programa y lo vuelve a abrir.
+        // Los reportes, config_inventario.json y los .xlsx no se tocan.
+
+        private const string UPDATE_API = "https://api.github.com/repos/aarneth/inventario-ti/releases/latest";
+        private const string UPDATE_UA = "InventarioTI-Updater";
+        private bool updateDialogOpen = false;
+
+        private class UpdateInfo
+        {
+            public Version Version;
+            public string Tag;
+            public string Notes;
+            public string ZipUrl;
+            public string ZipName;
+            public string Sha256;   // null si GitHub no publica el digest
+            public string PageUrl;
+        }
+
+        private static Version CurrentVersion()
+        {
+            Version v = Assembly.GetExecutingAssembly().GetName().Version;
+            return new Version(v.Major, v.Minor, v.Build);
+        }
+
+        private static void EnableTls12()
+        {
+            // .NET Framework 4.x no siempre habilita TLS 1.2 por defecto; GitHub lo exige
+            try { ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072; } catch { }
+        }
+
+        // Carpeta con los archivos del programa (raiz de la USB). null = copia de desarrollo: no se actualiza.
+        private string GetInstallDir(out string error)
+        {
+            error = null;
+            string dir;
+            if (Program.IsExe)
+            {
+                dir = Path.GetDirectoryName(Application.ExecutablePath);
+            }
+            else
+            {
+                // El .bat autonomo del release define INV_SELF; el .bat del proyecto (con carpeta src) no
+                string self = Environment.GetEnvironmentVariable("INV_SELF");
+                if (string.IsNullOrEmpty(self))
+                {
+                    error = "Esta es la copia de desarrollo (Iniciar_Inventario.bat que usa la carpeta src). Las actualizaciones autom\u00E1ticas solo funcionan con el paquete del release.";
+                    return null;
+                }
+                dir = Path.GetDirectoryName(self);
+            }
+            if (File.Exists(Path.Combine(Path.Combine(dir, "src"), "InventarioApp.cs")))
+            {
+                error = "Esta es la carpeta del proyecto (contiene src\\InventarioApp.cs). Las actualizaciones autom\u00E1ticas solo funcionan con el paquete del release copiado en la USB.";
+                return null;
+            }
+            return dir;
+        }
+
+        private static UpdateInfo FetchLatestRelease()
+        {
+            EnableTls12();
+            HttpWebRequest req = (HttpWebRequest)WebRequest.Create(UPDATE_API);
+            req.UserAgent = UPDATE_UA;
+            req.Accept = "application/vnd.github+json";
+            req.Timeout = 8000;
+            req.ReadWriteTimeout = 8000;
+            string json;
+            using (WebResponse resp = req.GetResponse())
+            using (StreamReader sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+            {
+                json = sr.ReadToEnd();
+            }
+
+            JavaScriptSerializer ser = new JavaScriptSerializer();
+            ser.MaxJsonLength = int.MaxValue;
+            Dictionary<string, object> root = ser.Deserialize<Dictionary<string, object>>(json);
+            if (root == null) return null;
+
+            UpdateInfo info = new UpdateInfo();
+            info.Tag = root.ContainsKey("tag_name") ? Convert.ToString(root["tag_name"]) : "";
+            Match mv = Regex.Match(info.Tag, @"(\d+)\.(\d+)\.(\d+)");
+            if (!mv.Success) return null;
+            info.Version = new Version(int.Parse(mv.Groups[1].Value), int.Parse(mv.Groups[2].Value), int.Parse(mv.Groups[3].Value));
+            info.Notes = root.ContainsKey("body") ? Convert.ToString(root["body"]) : "";
+            info.PageUrl = root.ContainsKey("html_url") ? Convert.ToString(root["html_url"]) : "";
+
+            System.Collections.IEnumerable assets = root.ContainsKey("assets") ? root["assets"] as System.Collections.IEnumerable : null;
+            if (assets != null)
+            {
+                foreach (object o in assets)
+                {
+                    Dictionary<string, object> a = o as Dictionary<string, object>;
+                    if (a == null) continue;
+                    string name = a.ContainsKey("name") ? Convert.ToString(a["name"]) : "";
+                    if (!Regex.IsMatch(name, @"^InventarioTI_v[\d.]+\.zip$", RegexOptions.IgnoreCase)) continue;
+                    info.ZipName = name;
+                    info.ZipUrl = a.ContainsKey("browser_download_url") ? Convert.ToString(a["browser_download_url"]) : "";
+                    string dg = a.ContainsKey("digest") && a["digest"] != null ? Convert.ToString(a["digest"]) : "";
+                    if (dg.StartsWith("sha256:", StringComparison.OrdinalIgnoreCase)) info.Sha256 = dg.Substring(7).Trim().ToLowerInvariant();
+                    break;
+                }
+            }
+            if (string.IsNullOrEmpty(info.ZipUrl)) return null;
+            return info;
+        }
+
+        // Al abrir: busca en segundo plano y solo avisa si hay una version nueva (sin internet = silencioso)
+        private void CheckForUpdatesInBackground()
+        {
+            string err;
+            if (GetInstallDir(out err) == null) return;
+            Thread th = new Thread(delegate()
+            {
+                UpdateInfo info = null;
+                try { info = FetchLatestRelease(); }
+                catch { }
+                if (info == null || info.Version <= CurrentVersion()) return;
+                try { this.BeginInvoke((MethodInvoker)delegate { OfferUpdate(info); }); }
+                catch { }
+            });
+            th.IsBackground = true;
+            th.Start();
+        }
+
+        private void CheckForUpdatesManual()
+        {
+            this.Cursor = Cursors.WaitCursor;
+            lblStatusText.Text = "Buscando actualizaciones...";
+            Application.DoEvents();
+            UpdateInfo info = null;
+            string error = null;
+            try { info = FetchLatestRelease(); }
+            catch (Exception ex) { error = ex.Message; }
+            finally { this.Cursor = Cursors.Default; }
+
+            if (error != null)
+            {
+                lblStatusText.Text = "No se pudo buscar actualizaciones.";
+                MessageBox.Show("No se pudo consultar si hay una versi\u00F3n nueva. Verifica la conexi\u00F3n a internet.\n\nDetalle: " + error,
+                    "Buscar actualizaciones", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            if (info == null)
+            {
+                lblStatusText.Text = "No se encontr\u00F3 un paquete de actualizaci\u00F3n.";
+                MessageBox.Show("El \u00FAltimo release publicado no tiene un paquete InventarioTI_v*.zip.",
+                    "Buscar actualizaciones", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            if (info.Version <= CurrentVersion())
+            {
+                lblStatusText.Text = string.Format("Ya tienes la \u00FAltima versi\u00F3n (v{0}).", CurrentVersion());
+                MessageBox.Show(string.Format("Ya tienes la \u00FAltima versi\u00F3n (v{0}).", CurrentVersion()),
+                    "Buscar actualizaciones", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            OfferUpdate(info);
+        }
+
+        // Las notas del release vienen en Markdown: se limpian para mostrarlas como texto plano
+        private static string ReleaseNotesToText(string md)
+        {
+            List<string> res = new List<string>();
+            foreach (string raw in (md ?? "").Replace("\r\n", "\n").Split('\n'))
+            {
+                string l = raw.TrimEnd();
+                if (l.IndexOf("Generated with", StringComparison.OrdinalIgnoreCase) >= 0) continue;
+                if (Regex.IsMatch(l, @"^\|?\s*-{3,}")) continue;
+                l = Regex.Replace(l, @"^#+\s*", "");
+                l = Regex.Replace(l, @"^(\s*)[-*]\s+", "$1\u2022 ");
+                l = l.Replace("**", "").Replace("`", "");
+                l = Regex.Replace(l, @"\[([^\]]+)\]\([^)]+\)", "$1");
+                if (l.StartsWith("|")) l = l.Trim('|').Replace(" | ", "  -  ").Trim();
+                res.Add(l);
+            }
+            return string.Join("\r\n", res.ToArray()).Trim();
+        }
+
+        private void OfferUpdate(UpdateInfo info)
+        {
+            if (updateDialogOpen) return;
+            updateDialogOpen = true;
+            try
+            {
+                using (Form dlg = new Form())
+                {
+                    dlg.Text = "Actualizaci\u00F3n disponible";
+                    dlg.FormBorderStyle = FormBorderStyle.FixedDialog;
+                    dlg.MaximizeBox = false;
+                    dlg.MinimizeBox = false;
+                    dlg.ShowInTaskbar = false;
+                    dlg.StartPosition = FormStartPosition.CenterParent;
+                    dlg.ClientSize = new Size(600, 460);
+                    dlg.Font = new Font("Segoe UI", 9.5F);
+                    if (this.Icon != null) dlg.Icon = this.Icon;
+
+                    Label t1 = new Label();
+                    t1.Text = string.Format("Hay una versi\u00F3n nueva: v{0}   (tienes la v{1})", info.Version, CurrentVersion());
+                    t1.Font = new Font("Segoe UI", 12F, FontStyle.Bold);
+                    t1.ForeColor = Color.FromArgb(15, 23, 42);
+                    t1.AutoSize = true;
+                    t1.Location = new Point(16, 14);
+
+                    Label t2 = new Label();
+                    t2.Text = "Novedades:";
+                    t2.AutoSize = true;
+                    t2.Location = new Point(18, 48);
+
+                    TextBox txt = new TextBox();
+                    txt.Multiline = true;
+                    txt.ReadOnly = true;
+                    txt.ScrollBars = ScrollBars.Vertical;
+                    txt.BackColor = Color.White;
+                    txt.Location = new Point(18, 70);
+                    txt.Size = new Size(564, 280);
+                    txt.Text = ReleaseNotesToText(info.Notes);
+                    txt.SelectionStart = 0;
+
+                    Label t3 = new Label();
+                    t3.Text = "Se reemplazar\u00E1n InventarioTI.exe e Iniciar_Inventario.bat en la carpeta del programa y se volver\u00E1 a abrir. " +
+                        "Los reportes .txt, la configuraci\u00F3n y los Excel no se modifican.";
+                    t3.ForeColor = Color.FromArgb(71, 85, 105);
+                    t3.Location = new Point(18, 360);
+                    t3.Size = new Size(564, 40);
+
+                    Button bOk = new Button();
+                    bOk.Text = "Actualizar ahora";
+                    bOk.DialogResult = DialogResult.OK;
+                    bOk.Size = new Size(150, 32);
+                    bOk.Location = new Point(276, 412);
+                    bOk.BackColor = Color.FromArgb(37, 99, 235);
+                    bOk.ForeColor = Color.White;
+                    bOk.FlatStyle = FlatStyle.Flat;
+
+                    Button bNo = new Button();
+                    bNo.Text = "Ahora no";
+                    bNo.DialogResult = DialogResult.Cancel;
+                    bNo.Size = new Size(150, 32);
+                    bNo.Location = new Point(432, 412);
+
+                    dlg.AcceptButton = bOk;
+                    dlg.CancelButton = bNo;
+                    dlg.Controls.AddRange(new Control[] { t1, t2, txt, t3, bOk, bNo });
+                    if (dlg.ShowDialog(this) != DialogResult.OK) return;
+                }
+                InstallUpdate(info);
+            }
+            finally
+            {
+                updateDialogOpen = false;
+            }
+        }
+
+        private static string FileSha256(string path)
+        {
+            using (System.Security.Cryptography.SHA256 sha = System.Security.Cryptography.SHA256.Create())
+            using (FileStream fs = File.OpenRead(path))
+            {
+                byte[] h = sha.ComputeHash(fs);
+                StringBuilder sb = new StringBuilder();
+                foreach (byte b in h) sb.Append(b.ToString("x2"));
+                return sb.ToString();
+            }
+        }
+
+        private bool DownloadWithProgress(string url, string dest, Version ver)
+        {
+            EnableTls12();
+            bool ok = false;
+            string error = null;
+            using (Form dlg = new Form())
+            using (WebClient wc = new WebClient())
+            {
+                dlg.Text = "Descargando actualizaci\u00F3n";
+                dlg.FormBorderStyle = FormBorderStyle.FixedDialog;
+                dlg.ControlBox = false;
+                dlg.ShowInTaskbar = false;
+                dlg.StartPosition = FormStartPosition.CenterParent;
+                dlg.ClientSize = new Size(420, 120);
+                dlg.Font = new Font("Segoe UI", 9.5F);
+
+                Label lbl = new Label();
+                lbl.Text = string.Format("Descargando la versi\u00F3n v{0}...", ver);
+                lbl.AutoSize = true;
+                lbl.Location = new Point(18, 16);
+                ProgressBar pb = new ProgressBar();
+                pb.Location = new Point(20, 44);
+                pb.Size = new Size(380, 22);
+                Button bCancel = new Button();
+                bCancel.Text = "Cancelar";
+                bCancel.Size = new Size(100, 28);
+                bCancel.Location = new Point(300, 80);
+                bCancel.Click += delegate { wc.CancelAsync(); };
+                dlg.Controls.AddRange(new Control[] { lbl, pb, bCancel });
+
+                wc.Headers[HttpRequestHeader.UserAgent] = UPDATE_UA;
+                wc.DownloadProgressChanged += delegate(object s, DownloadProgressChangedEventArgs e) {
+                    pb.Value = Math.Max(0, Math.Min(100, e.ProgressPercentage));
+                };
+                wc.DownloadFileCompleted += delegate(object s, System.ComponentModel.AsyncCompletedEventArgs e) {
+                    if (e.Cancelled) error = null;
+                    else if (e.Error != null) error = e.Error.Message;
+                    else ok = true;
+                    dlg.Close();
+                };
+                dlg.Shown += delegate { wc.DownloadFileAsync(new Uri(url), dest); };
+                dlg.ShowDialog(this);
+            }
+            if (!ok && error != null)
+                MessageBox.Show("No se pudo descargar la actualizaci\u00F3n:\n" + error, "Actualizaci\u00F3n", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return ok;
+        }
+
+        private void InstallUpdate(UpdateInfo info)
+        {
+            string err;
+            string installDir = GetInstallDir(out err);
+            if (installDir == null)
+            {
+                MessageBox.Show(err, "Actualizaci\u00F3n", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            // Antes de cerrar: guardar o descartar las ediciones pendientes de la tabla
+            if (!ConfirmSaveOrDiscardGridChanges()) return;
+
+            string work = Path.Combine(Path.GetTempPath(), "InventarioTI_update");
+            string zipPath = Path.Combine(work, info.ZipName);
+            string extract = Path.Combine(work, "nuevo");
+            try
+            {
+                if (Directory.Exists(work)) Directory.Delete(work, true);
+                Directory.CreateDirectory(work);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("No se pudo preparar la carpeta temporal:\n" + ex.Message, "Actualizaci\u00F3n", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            lblStatusText.Text = string.Format("Descargando la versi\u00F3n v{0}...", info.Version);
+            if (!DownloadWithProgress(info.ZipUrl, zipPath, info.Version))
+            {
+                lblStatusText.Text = "Actualizaci\u00F3n cancelada.";
+                return;
+            }
+
+            string curExe = Path.Combine(installDir, "InventarioTI.exe");
+            string curBat = Path.Combine(installDir, "Iniciar_Inventario.bat");
+            try
+            {
+                if (!string.IsNullOrEmpty(info.Sha256) && !string.Equals(FileSha256(zipPath), info.Sha256, StringComparison.OrdinalIgnoreCase))
+                    throw new Exception("La descarga est\u00E1 da\u00F1ada: su SHA-256 no coincide con el publicado. Intenta nuevamente.");
+
+                ZipFile.ExtractToDirectory(zipPath, extract);
+                string newExe = Path.Combine(extract, "InventarioTI.exe");
+                string newBat = Path.Combine(extract, "Iniciar_Inventario.bat");
+                if (!File.Exists(newExe) || !File.Exists(newBat))
+                    throw new Exception("El paquete descargado no contiene InventarioTI.exe e Iniciar_Inventario.bat.");
+
+                // Windows no deja sobrescribir un .exe en ejecucion, pero si renombrarlo. El .old se borra al abrir.
+                string oldExe = curExe + ".old";
+                if (File.Exists(oldExe)) File.Delete(oldExe);
+                if (File.Exists(curExe)) File.Move(curExe, oldExe);
+                try { File.Copy(newExe, curExe, true); }
+                catch
+                {
+                    if (!File.Exists(curExe) && File.Exists(oldExe)) File.Move(oldExe, curExe);
+                    throw;
+                }
+                // Si el programa corre desde el .bat, cmd.exe vuelve a leer ese archivo al terminar. La cabecera del
+                // .bat (build/empaquetar_release.ps1) es identica en todas las versiones, por eso se puede reemplazar.
+                File.Copy(newBat, curBat, true);
+            }
+            catch (Exception ex)
+            {
+                lblStatusText.Text = "No se pudo instalar la actualizaci\u00F3n.";
+                MessageBox.Show("No se pudo instalar la actualizaci\u00F3n:\n" + ex.Message +
+                    "\n\nEl programa sigue en la versi\u00F3n actual. Tambi\u00E9n puedes descargarla manualmente desde:\n" + info.PageUrl,
+                    "Actualizaci\u00F3n", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+            try { Directory.Delete(work, true); } catch { }
+
+            MessageBox.Show(string.Format("Se instal\u00F3 la versi\u00F3n v{0}. El programa se volver\u00E1 a abrir.", info.Version),
+                "Actualizaci\u00F3n completada", MessageBoxButtons.OK, MessageBoxIcon.Information);
+
+            try
+            {
+                ProcessStartInfo psi;
+                if (Program.IsExe)
+                {
+                    psi = new ProcessStartInfo(curExe);
+                }
+                else
+                {
+                    psi = new ProcessStartInfo("cmd.exe", "/c \"\"" + curBat + "\"\"");
+                    psi.WindowStyle = ProcessWindowStyle.Minimized;
+                }
+                psi.WorkingDirectory = installDir;
+                psi.UseShellExecute = true;
+                Process.Start(psi);
+            }
+            catch (Exception ex)
+            {
+                // Tipicamente Kaspersky / Smart App Control bloqueando el .exe nuevo (otro hash) hasta que se apruebe
+                MessageBox.Show(string.Format("La versi\u00F3n v{0} qued\u00F3 instalada, pero no se pudo abrir InventarioTI.exe:\n{1}\n\n" +
+                    "Puede estar bloqueado por el antivirus hasta que Seguridad TI apruebe el nuevo hash. " +
+                    "Mientras tanto, usa Iniciar_Inventario.bat.", info.Version, ex.Message),
+                    "Actualizaci\u00F3n", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            cerrandoPorActualizacion = true;
+            this.Close();
+        }
+
+        // Al abrir la version nueva: borrar el InventarioTI.exe.old que dejo la actualizacion
+        private void CleanupAfterUpdate()
+        {
+            string err;
+            string dir = GetInstallDir(out err);
+            if (dir == null) return;
+            string oldExe = Path.Combine(dir, "InventarioTI.exe.old");
+            if (!File.Exists(oldExe)) return;
+            Thread th = new Thread(delegate()
+            {
+                // El proceso anterior puede tardar un momento en cerrarse
+                for (int i = 0; i < 20; i++)
+                {
+                    try { File.Delete(oldExe); return; }
+                    catch { Thread.Sleep(500); }
+                }
+            });
+            th.IsBackground = true;
+            th.Start();
         }
 
         // ===================== Ayuda > Acerca de =====================
@@ -3497,6 +3960,9 @@ namespace SistemaInventarioTI
 
     public static class Program
     {
+        // true = se ejecuta como InventarioTI.exe; false = desde Iniciar_Inventario.bat (Add-Type)
+        public static bool IsExe = false;
+
         [DllImport("kernel32.dll")]
         private static extern IntPtr GetConsoleWindow();
 
@@ -3508,6 +3974,7 @@ namespace SistemaInventarioTI
         [STAThread]
         public static void Main()
         {
+            IsExe = true;
             StartApp();
         }
 

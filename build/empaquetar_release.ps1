@@ -34,6 +34,9 @@ Copy-Item (Join-Path $root 'InventarioTI.exe') $stage
 
 # 3. Generar Iniciar_Inventario.bat autonomo: cabecera + marcador + codigo C#
 #    El marcador se arma por concatenacion dentro del comando para que IndexOf no lo encuentre en la cabecera.
+# IMPORTANTE: no cambiar la cabecera del .bat entre versiones. La actualizacion automatica reemplaza el .bat
+# mientras cmd.exe lo esta ejecutando; cmd retoma la lectura en la misma posicion, que con una cabecera
+# identica cae en las mismas lineas finales (if errorlevel / popd / exit).
 $marker = '//###CODIGO_CSHARP###'
 $header = @'
 @echo off
