@@ -147,6 +147,8 @@ namespace SistemaInventarioTI
         // Actualizaciones automaticas (ver region "Actualizaciones")
         private bool buscarActualizaciones = true;
         private bool cerrandoPorActualizacion = false;
+        // Ultimo .txt escrito (para "Archivo > Abrir carpeta del ultimo reporte")
+        private string lastSavedReportPath = null;
 
         private Label lblHeaderStats;
         private ToolStripStatusLabel lblStatusText;
@@ -441,6 +443,19 @@ namespace SistemaInventarioTI
 
             MenuStrip menu = new MenuStrip();
             menu.BackColor = Color.FromArgb(226, 232, 240);
+            ToolStripMenuItem mnuArchivo = new ToolStripMenuItem("Archivo");
+            ToolStripMenuItem mnuImpFiles = new ToolStripMenuItem("Importar reportes (.txt)...");
+            mnuImpFiles.Click += delegate { ImportReportsFromFiles(); };
+            ToolStripMenuItem mnuImpDir = new ToolStripMenuItem("Importar carpeta de reportes...");
+            mnuImpDir.Click += delegate { ImportReportsFromFolder(); };
+            ToolStripMenuItem mnuOpenDir = new ToolStripMenuItem("Abrir carpeta del \u00FAltimo reporte");
+            mnuOpenDir.Click += delegate { OpenLastReportFolder(); };
+            mnuArchivo.DropDownItems.Add(mnuImpFiles);
+            mnuArchivo.DropDownItems.Add(mnuImpDir);
+            mnuArchivo.DropDownItems.Add(new ToolStripSeparator());
+            mnuArchivo.DropDownItems.Add(mnuOpenDir);
+            menu.Items.Add(mnuArchivo);
+
             ToolStripMenuItem mnuAyuda = new ToolStripMenuItem("Ayuda");
             ToolStripMenuItem mnuAcerca = new ToolStripMenuItem("Acerca de...");
             mnuAcerca.ShortcutKeys = Keys.F1;
@@ -531,9 +546,9 @@ namespace SistemaInventarioTI
             cmbSeg = new ComboBox();
             cmbSeg.Items.AddRange(new object[] {
                 "CADENA DE SEGURIDAD",
-                "REMACHE / SIN CADENA",
+                "CON REMACHE/CON CADENA",
+                "CON REMACHE/SIN CADENA",
                 "SIN REMACHE/SIN CADENA",
-                "REMACHE Y CADENA",
                 "NINGUNO"
             });
             cmbSeg.SelectedIndex = 0;
@@ -1147,7 +1162,7 @@ namespace SistemaInventarioTI
                     cmbCat.Text = "LABORATORIO";
                     cmbArea.Text = "LABORATORIO DE COMPUTO " + numLab;
                     txtPiso.Text = numLab.Substring(0, 1);
-                    cmbSeg.Text = esLaptop ? "CADENA DE SEGURIDAD" : "REMACHE / SIN CADENA";
+                    cmbSeg.Text = esLaptop ? "CADENA DE SEGURIDAD" : "CON REMACHE/SIN CADENA";
                 }
                 else if (mAd.Success)
                 {
@@ -1394,6 +1409,159 @@ namespace SistemaInventarioTI
             }
             catch { }
             return mons;
+        }
+
+        // ===================== Archivo: importar reportes de otros equipos =====================
+        // Para equipos con la USB bloqueada: el programa se ejecuta en ese equipo desde una carpeta de red o descargado
+        // del release, el .txt se trae por red / correo / Teams / OneDrive y aqui se incorpora a la USB: cada reporte va a
+        // su carpeta (CATEGORIA\AREA) y, si el equipo ya existia, se muestra la comparacion campo por campo.
+
+        private void ImportReportsFromFiles()
+        {
+            using (OpenFileDialog dlg = new OpenFileDialog())
+            {
+                dlg.Title = "Importar reportes de inventario (.txt)";
+                dlg.Filter = "Reportes de inventario (*.txt)|*.txt";
+                dlg.Multiselect = true;
+                if (dlg.ShowDialog(this) != DialogResult.OK) return;
+                ImportReports(new List<string>(dlg.FileNames));
+            }
+        }
+
+        private void ImportReportsFromFolder()
+        {
+            using (FolderBrowserDialog dlg = new FolderBrowserDialog())
+            {
+                dlg.Description = "Elige la carpeta con los reportes .txt a importar (se revisan tambi\u00E9n sus subcarpetas).";
+                dlg.ShowNewFolderButton = false;
+                if (dlg.ShowDialog(this) != DialogResult.OK) return;
+                if (PathsEqual(dlg.SelectedPath, baseDir))
+                {
+                    MessageBox.Show("Esa es la carpeta del programa: sus reportes ya est\u00E1n incluidos.", "Importar", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+                List<string> files = new List<string>();
+                CollectTxtFilesSafe(dlg.SelectedPath, files, 0);
+                if (files.Count == 0)
+                {
+                    MessageBox.Show("No se encontraron archivos .txt en esa carpeta.", "Importar", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+                ImportReports(files);
+            }
+        }
+
+        // Recorrido recursivo que ignora carpetas sin permiso (ej. System Volume Information si eligen la raiz de una unidad)
+        private static void CollectTxtFilesSafe(string dir, List<string> result, int depth)
+        {
+            if (depth > 6) return;
+            try { result.AddRange(Directory.GetFiles(dir, "*.txt")); }
+            catch { }
+            string[] subs;
+            try { subs = Directory.GetDirectories(dir); }
+            catch { return; }
+            foreach (string s in subs)
+            {
+                try
+                {
+                    if ((new DirectoryInfo(s).Attributes & (FileAttributes.System | FileAttributes.Hidden)) != 0) continue;
+                }
+                catch { continue; }
+                CollectTxtFilesSafe(s, result, depth + 1);
+            }
+        }
+
+        private void ImportReports(List<string> files)
+        {
+            int nuevos = 0, actualizados = 0, sinCambios = 0, omitidos = 0, ignorados = 0;
+            List<string> errores = new List<string>();
+            List<string> detalle = new List<string>();
+
+            foreach (string src in files)
+            {
+                string nombre = Path.GetFileName(src);
+                try
+                {
+                    // Los archivos de historial (con fecha) no son reportes vigentes
+                    if (Regex.IsMatch(Path.GetFileNameWithoutExtension(src), @"_\d{8}_\d{6}$")) { ignorados++; continue; }
+                    string[] lines = File.ReadAllLines(src, Encoding.UTF8);
+                    if (string.Join("\n", lines).IndexOf("INVENTARIO DE HARDWARE Y RED", StringComparison.Ordinal) < 0) { ignorados++; continue; }
+
+                    InventoryReport nuevo = ParseReport(lines);
+                    string host = nuevo.Get("Hostname").Trim();
+                    if (host.Length == 0) { errores.Add(nombre + ": no tiene Hostname"); continue; }
+
+                    string destino = GetReportPath(nuevo);
+                    int cantidad;
+                    FileInfo previo = FindExistingReport(host, destino, out cantidad);
+                    if (previo != null && PathsEqual(previo.FullName, src)) { sinCambios++; continue; }
+
+                    if (previo == null)
+                    {
+                        WriteReportFile(destino, nuevo);
+                        nuevos++;
+                        detalle.Add("NUEVO        " + host + "  ->  " + RelPath(destino));
+                        continue;
+                    }
+
+                    InventoryReport anterior = ParseReport(File.ReadAllLines(previo.FullName, Encoding.UTF8));
+                    List<FieldDiff> diffs = ComputeReportDiffs(anterior, nuevo);
+                    if (diffs.Count == 0) { sinCambios++; continue; }
+
+                    int op = ShowFieldDiffDialog(host, previo, cantidad, anterior, destino, diffs);
+                    if (op != 1 && op != 2)
+                    {
+                        omitidos++;
+                        detalle.Add("OMITIDO      " + host);
+                        continue;
+                    }
+                    InventoryReport final;
+                    ApplyReportSave(previo, anterior, nuevo, diffs, op, out final);
+                    actualizados++;
+                    detalle.Add("ACTUALIZADO  " + host + "  ->  " + RelPath(GetReportPath(final)));
+                }
+                catch (Exception ex)
+                {
+                    errores.Add(nombre + ": " + ex.Message);
+                }
+            }
+
+            UpdateTxtCounterBadge();
+            if (tableTodos != null && (nuevos + actualizados) > 0) LoadTxtFilesIntoTable();
+
+            StringBuilder sb = new StringBuilder();
+            sb.AppendLine(string.Format("Nuevos: {0}   Actualizados: {1}   Sin cambios: {2}   Omitidos: {3}", nuevos, actualizados, sinCambios, omitidos));
+            if (ignorados > 0) sb.AppendLine(string.Format("No son reportes vigentes (otros .txt o historial con fecha): {0}", ignorados));
+            if (detalle.Count > 0)
+            {
+                sb.AppendLine();
+                foreach (string d in detalle.Take(25)) sb.AppendLine(d);
+                if (detalle.Count > 25) sb.AppendLine(string.Format("... y {0} m\u00E1s", detalle.Count - 25));
+            }
+            if (errores.Count > 0)
+            {
+                sb.AppendLine();
+                sb.AppendLine("Errores:");
+                foreach (string er in errores.Take(15)) sb.AppendLine("  " + er);
+            }
+            lblStatusText.Text = string.Format("Importaci\u00F3n: {0} nuevo(s), {1} actualizado(s), {2} sin cambios.", nuevos, actualizados, sinCambios);
+            MessageBox.Show(sb.ToString(), "Importar reportes", MessageBoxButtons.OK,
+                errores.Count > 0 ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
+        }
+
+        private void OpenLastReportFolder()
+        {
+            try
+            {
+                if (!string.IsNullOrEmpty(lastSavedReportPath) && File.Exists(lastSavedReportPath))
+                    Process.Start("explorer.exe", "/select,\"" + lastSavedReportPath + "\"");
+                else
+                    Process.Start("explorer.exe", "\"" + baseDir + "\"");
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("No se pudo abrir la carpeta:\n" + ex.Message, "Abrir carpeta", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
         }
 
         // ===================== Actualizaciones (releases publicos de GitHub) =====================
@@ -2347,7 +2515,7 @@ namespace SistemaInventarioTI
                 if (ic >= 0) cmbCat.SelectedIndex = ic;
                 cmbArea.Text = r.Get("Area / Ambiente");
                 txtPiso.Text = r.Get("Piso Ubicacion");
-                cmbSeg.Text = r.Get("Seguridad Fisica");
+                cmbSeg.Text = NormalizeSeguridad(r.Get("Seguridad Fisica"));
                 // Reportes antiguos guardaban el chasis ("Mini PC", "Notebook"...): se muestra ya como PC / LAPTOP
                 txtTipo.Text = NormalizeTipoEquipo(r.Get("Tipo de Equipo"), r.Get("Hostname"));
                 txtMarca.Text = r.Get("Marca");
@@ -2476,6 +2644,7 @@ namespace SistemaInventarioTI
             string dir = Path.GetDirectoryName(path);
             if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
             File.WriteAllLines(path, ReportToLines(r).ToArray(), Encoding.UTF8);
+            lastSavedReportPath = path;
         }
 
         // Busca el reporte vigente del equipo en TODAS las carpetas de inventario (no solo en la carpeta actual)
@@ -2891,7 +3060,7 @@ namespace SistemaInventarioTI
                 string pestanaDestino = data.ContainsKey("Categoria Ubicacion") ? data["Categoria Ubicacion"].ToUpper() : "ADMINISTRATIVOS";
                 string piso = data.ContainsKey("Piso Ubicacion") ? data["Piso Ubicacion"] : "";
                 string area = data.ContainsKey("Area / Ambiente") ? data["Area / Ambiente"] : "";
-                string remachado = data.ContainsKey("Seguridad Fisica") ? data["Seguridad Fisica"] : "";
+                string remachado = NormalizeSeguridad(data.ContainsKey("Seguridad Fisica") ? data["Seguridad Fisica"] : "");
                 if (string.Equals(remachado, "NINGUNO", StringComparison.OrdinalIgnoreCase)) remachado = "";
 
                 string aulaLabAdm = "ADMINISTRATIVO";
@@ -2915,7 +3084,7 @@ namespace SistemaInventarioTI
                     if (string.IsNullOrEmpty(piso)) piso = numLab.Substring(0, 1);
                     if (string.IsNullOrEmpty(area)) area = "LABORATORIO DE COMPUTO " + numLab;
                     aulaLabAdm = area;
-                    if (string.IsNullOrEmpty(remachado) && tipo == "PC") remachado = "REMACHE / SIN CADENA";
+                    if (string.IsNullOrEmpty(remachado) && tipo == "PC") remachado = "CON REMACHE/SIN CADENA";
                 }
                 else if (mAd.Success)
                 {
@@ -2951,11 +3120,7 @@ namespace SistemaInventarioTI
                 else if (marcaRaw.Contains("LENOVO")) marca = "LENOVO";
                 else if (marcaRaw.Contains("DELL")) marca = "DELL";
 
-                string modelo = data.ContainsKey("Modelo") ? data["Modelo"] : "";
-                Match mLen = Regex.Match(modelo, @"\(([^)]+)\)");
-                if (mLen.Success && marca == "LENOVO") modelo = mLen.Groups[1].Value.Trim();
-                modelo = Regex.Replace(modelo, @"^(HP|Lenovo)\s+", "", RegexOptions.IgnoreCase);
-                modelo = Regex.Replace(modelo, @"\s+(Desktop PC|Notebook PC)$", "", RegexOptions.IgnoreCase).Trim();
+                string modelo = CleanModeloExcel(data.ContainsKey("Modelo") ? data["Modelo"] : "", marca);
 
                 string serie = data.ContainsKey("Serie del Equipo")
                     ? Regex.Replace(data["Serie del Equipo"], @"\s*\(Serie Placa Base\)", "").Trim()
@@ -2999,41 +3164,19 @@ namespace SistemaInventarioTI
                         monModelo = mMod;
                     monSerie = mSer;
                 }
+                else if (tipo == "LAPTOP")
+                {
+                    monModelo = "N/A";
+                    monSerie = "N/A";
+                }
 
                 string fechaInv = DateTime.Now.ToString("yyyy-MM-dd");
                 if (data.ContainsKey("Fecha de Auditoria") && data["Fecha de Auditoria"].Length >= 10)
                     fechaInv = data["Fecha de Auditoria"].Substring(0, 10);
 
-                List<string> nombresArr = new List<string>();
-                List<string> correosArr = new List<string>();
-                foreach (string u in users)
-                {
-                    string uAcc = Regex.Match(u, @"Usuario:\s*([^\[]+)").Groups[1].Value.Trim();
-                    string uName = Regex.Match(u, @"Nombre:\s*([^|]+)").Groups[1].Value.Trim();
-                    string uMail = Regex.Match(u, @"Correo:\s*(.+)$").Groups[1].Value.Trim();
-                    string uShort = uAcc.Contains("\\") ? uAcc.Substring(uAcc.IndexOf('\\') + 1) : uAcc;
-
-                    if (!string.IsNullOrEmpty(uName) && uName.IndexOf("Sin nombre registrado", StringComparison.OrdinalIgnoreCase) < 0)
-                        nombresArr.Add(uName.ToUpper());
-                    else if (!string.IsNullOrEmpty(uShort))
-                        nombresArr.Add(uShort.ToUpper());
-
-                    if (!string.IsNullOrEmpty(uMail) && uMail.IndexOf("Sin correo registrado", StringComparison.OrdinalIgnoreCase) < 0)
-                        correosArr.Add(uMail.ToLower());
-                }
-
                 string usuariosFinal;
                 string correosFinal;
-                if ((pestanaDestino == "AULAS" || pestanaDestino == "LABORATORIO") && nombresArr.Count == 0)
-                {
-                    usuariosFinal = "DOCENTE";
-                    correosFinal = "";
-                }
-                else
-                {
-                    usuariosFinal = string.Join("/", nombresArr.Distinct().ToArray());
-                    correosFinal = string.Join("/", correosArr.Distinct().ToArray());
-                }
+                BuildUsuariosExcel(users, pestanaDestino, out usuariosFinal, out correosFinal);
 
                 string agenteHp = data.ContainsKey("HP Insights") ? data["HP Insights"] : "";
                 hpAgentByFile[file.FullName] = agenteHp;
@@ -3084,6 +3227,99 @@ namespace SistemaInventarioTI
 
             ApplyGridFilter();
             UpdateTxtCounterBadge();
+        }
+
+        // MODELO para el Excel: solo el modelo comercial. Ej. "HP Pro Mini 400 G9 Desktop PC (SBKPFV3)" -> "Pro Mini 400 G9",
+        // "HP ProBook 450 15.6 inch G10 Notebook PC (SBKPFV3)" -> "ProBook 450 G10". En Lenovo el nombre comercial
+        // viene entre parentesis (Win32_ComputerSystemProduct.Version) y es el que se usa.
+        private static string CleanModeloExcel(string modelo, string marca)
+        {
+            string m = (modelo ?? "").Trim();
+            if (m.IndexOf("validar presencialmente", StringComparison.OrdinalIgnoreCase) >= 0) return m;
+            Match mPar = Regex.Match(m, @"\(([^)]+)\)\s*$");
+            if (mPar.Success && string.Equals(marca, "LENOVO", StringComparison.OrdinalIgnoreCase))
+                m = mPar.Groups[1].Value.Trim();
+            else
+                m = Regex.Replace(m, @"\s*\([^)]*\)\s*$", "");
+            m = Regex.Replace(m, @"^(HP|Hewlett[- ]Packard|Lenovo|Dell( Inc\.)?)\s+", "", RegexOptions.IgnoreCase);
+            m = Regex.Replace(m, @"\s+(Desktop\s+Mini|Small\s+Form\s+Factor|Micro\s*tower|Tower|Desktop|Notebook|Laptop|All[- ]in[- ]One|Mobile\s+Workstation|Workstation)(\s+PC)?$", "", RegexOptions.IgnoreCase);
+            m = Regex.Replace(m, @"\s+\d+(\.\d+)?\s*(-?inch|in|"")(?=\s|$)", "", RegexOptions.IgnoreCase);
+            return Regex.Replace(m, @"\s{2,}", " ").Trim();
+        }
+
+        // Valores de REMACHADO / CADENA uniformes (decision del usuario). Convierte tambien los de reportes antiguos.
+        private static string NormalizeSeguridad(string s)
+        {
+            string v = Regex.Replace((s ?? "").Trim().ToUpperInvariant(), @"\s*/\s*", "/");
+            if (v == "REMACHE Y CADENA" || v == "REMACHE/CADENA" || v == "CON REMACHE/CON CADENA") return "CON REMACHE/CON CADENA";
+            if (v == "REMACHE/SIN CADENA" || v == "CON REMACHE/SIN CADENA") return "CON REMACHE/SIN CADENA";
+            if (v == "SIN REMACHE/SIN CADENA") return "SIN REMACHE/SIN CADENA";
+            if (v == "SIN REMACHE/CADENA" || v == "SIN REMACHE/CON CADENA") return "SIN REMACHE/CON CADENA";
+            return (s ?? "").Trim();
+        }
+
+        private static string SinTildes(string s)
+        {
+            string d = (s ?? "").Normalize(NormalizationForm.FormD);
+            StringBuilder sb = new StringBuilder();
+            foreach (char c in d)
+            {
+                if (System.Globalization.CharUnicodeInfo.GetUnicodeCategory(c) != System.Globalization.UnicodeCategory.NonSpacingMark)
+                    sb.Append(c);
+            }
+            return sb.ToString();
+        }
+
+        // NOMBRE Y APELLIDO / CORREO para el Excel a partir de las lineas "Usuario Equipo" del .txt:
+        // - Se ignoran las cuentas LOCALES de soporte (nombre o cuenta con "soporte") y la cuenta soporte.ti.
+        // - Cuentas genericas: "doc..." = DOCENTE y "alu..." = ALUMNO (doccarrion, alucarrion y equivalentes UPNW), sin correo.
+        // - CORREO: solo los correos de usuarios reales; "N/A" si todos son DOCENTE / ALUMNO.
+        // - Sin usuarios: AULAS / LABORATORIO = DOCENTE con N/A; ADMINISTRATIVOS = vacio (se completa a mano).
+        private static void BuildUsuariosExcel(List<string> users, string categoria, out string nombres, out string correos)
+        {
+            List<string> nombresArr = new List<string>();
+            List<string> correosArr = new List<string>();
+            bool hayGenerico = false;
+            foreach (string u in users)
+            {
+                string uAcc = Regex.Match(u, @"Usuario:\s*([^\[|]+)").Groups[1].Value.Trim();
+                string uName = Regex.Match(u, @"Nombre:\s*([^|]+)").Groups[1].Value.Trim();
+                string uMail = Regex.Match(u, @"Correo:\s*(.+)$").Groups[1].Value.Trim();
+                bool local = u.IndexOf("[Local]", StringComparison.OrdinalIgnoreCase) >= 0;
+                string uShort = uAcc.Contains("\\") ? uAcc.Substring(uAcc.IndexOf('\\') + 1) : uAcc;
+                if (uName.IndexOf("Sin nombre registrado", StringComparison.OrdinalIgnoreCase) >= 0) uName = "";
+
+                string cuenta = SinTildes(uShort).ToLowerInvariant();
+                if (cuenta == "soporte.ti") continue;
+                if (local && (cuenta.Contains("soporte") || SinTildes(uName).ToLowerInvariant().Contains("soporte"))) continue;
+
+                string generico = null;
+                if (cuenta.StartsWith("doc")) generico = "DOCENTE";
+                else if (cuenta.StartsWith("alu")) generico = "ALUMNO";
+                if (generico != null)
+                {
+                    hayGenerico = true;
+                    if (!nombresArr.Contains(generico)) nombresArr.Add(generico);
+                    continue;
+                }
+
+                string nom = uName.Length > 0 ? uName.ToUpper() : uShort.ToUpper();
+                if (nom.Length > 0 && !nombresArr.Contains(nom)) nombresArr.Add(nom);
+                if (uMail.Length > 0 && uMail.IndexOf("Sin correo registrado", StringComparison.OrdinalIgnoreCase) < 0)
+                {
+                    string mail = uMail.ToLower();
+                    if (!correosArr.Contains(mail)) correosArr.Add(mail);
+                }
+            }
+
+            if (nombresArr.Count == 0 && (categoria == "AULAS" || categoria == "LABORATORIO"))
+            {
+                nombresArr.Add("DOCENTE");
+                hayGenerico = true;
+            }
+            nombres = string.Join("/", nombresArr.ToArray());
+            if (correosArr.Count > 0) correos = string.Join("/", correosArr.ToArray());
+            else correos = hayGenerico ? "N/A" : "";
         }
 
         // Regla de negocio: otras marcas = "NO"; en equipos HP depende del agente HP Insights detectado

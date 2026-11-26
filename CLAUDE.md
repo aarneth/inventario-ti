@@ -31,8 +31,11 @@ Aplicación de escritorio Windows Forms escrita en **C# (.NET Framework 4.x)** p
   - `ADMINISTRATIVOS`: **27 columnas** (incluye `OBSERVACIÓN` al final).
   - `AULAS` y `LABORATORIO`: **26 columnas** (omiten `OBSERVACIÓN`).
   - Múltiples usuarios en un mismo equipo se unen con `/` en MAYÚSCULAS (`USUARIO 1/USUARIO 2`) y sus correos de AD con `/` en minúsculas (`correo1@dominio/correo2@dominio`).
+  - **Usuarios (`BuildUsuariosExcel()`):** se ignoran las cuentas **locales** de soporte (cuenta o nombre con "soporte") y la cuenta `soporte.ti`; otras cuentas locales sí cuentan. Cuentas que empiezan con `doc` = `DOCENTE` y con `alu` = `ALUMNO` (doccarrion, alucarrion y equivalentes UPNW). `CORREO` solo lleva correos de usuarios reales; `N/A` si todos son DOCENTE/ALUMNO. Sin usuarios: AULAS/LABORATORIO = `DOCENTE` + `N/A`; ADMINISTRATIVOS = vacío.
+  - **MODELO (`CleanModeloExcel()`):** solo el modelo comercial, sin marca, sin código entre paréntesis, sin tamaño de pantalla ni tipo de chasis (ej. `Pro Mini 400 G9`, `ProBook 450 G10`). En Lenovo se usa el nombre entre paréntesis. El `.txt` conserva el modelo completo.
+  - **REMACHADO / CADENA (`NormalizeSeguridad()`):** `CON REMACHE/CON CADENA`, `CON REMACHE/SIN CADENA`, `SIN REMACHE/SIN CADENA`, `CADENA DE SEGURIDAD` (laptops). Los valores antiguos (`REMACHE Y CADENA`, `REMACHE / SIN CADENA`) se convierten al consolidar y al abrir el reporte.
   - **Tipo de equipo:** solo `PC` o `LAPTOP` (en el `.txt`, la pestaña 1 y el Excel), calculado con `NormalizeTipoEquipo()`: `LAPTOP` si el hostname tiene `LP` o el chasis es portátil (Laptop/Notebook/Convertible/Tablet); todo lo demás (torre, Mini PC, All-in-One, no identificado) = `PC`.
-  - En `LAPTOP`, las columnas `MONITOR-MODELO` y `SERIE MONITOR` quedan vacías si solo usan pantalla integrada.
+  - En `LAPTOP`, las columnas `MONITOR-MODELO` y `SERIE MONITOR` = `N/A`.
   - **ANTIVIRUS / ABSOLUTE / HP INSIGHTS** salen de la detección real (`ScanSecuritySoftware()`, sin admin) guardada en el `.txt` como `Antivirus`, `Absolute` y `HP Insights`:
     - `ANTIVIRUS` = `SÍ` **solo si es Kaspersky** (`CalcAntivirusCol()`); Defender u otro = `NO`.
     - `ABSOLUTE` = `SÍ`/`NO` según el agente (`CalcAgentCol()`).
@@ -52,6 +55,7 @@ Aplicación de escritorio Windows Forms escrita en **C# (.NET Framework 4.x)** p
   - Opciones del diálogo: aceptar todo lo nuevo, mantener todo lo del Excel, o elegir campo por campo.
   - "Mantener dato del Excel" se guarda en el `.txt` como `Ajuste Manual`, para que no vuelva a preguntar.
   - Equipos nuevos: se agregan. Equipos que ya no tienen `.txt`: se pregunta si se conservan.
+- **Equipos con USB bloqueada:** el programa se ejecuta en ese equipo desde una carpeta de red o descargado del release; el `.txt` se trae por red/correo/Teams/OneDrive y se incorpora con `Archivo > Importar reportes (.txt)` o `Importar carpeta de reportes` (`ImportReports()`): reporte nuevo = se ubica en `CATEGORÍA\ÁREA`; equipo existente = mismo diálogo de comparación campo por campo (`ShowFieldDiffDialog` + `ApplyReportSave`); los archivos de historial con fecha y los `.txt` que no son reportes se ignoran. `Archivo > Abrir carpeta del último reporte` abre el Explorador en el último `.txt` escrito.
 - **Layout:** el contenido de cada pestaña se construye con su tamaño de diseño (1156x650) **antes** de agregarla al `TabControl`; si no, los controles anclados abajo (GUARDAR, EXPORTAR) quedan fuera de la vista.
 
 ## Comandos de Prueba y Verificación

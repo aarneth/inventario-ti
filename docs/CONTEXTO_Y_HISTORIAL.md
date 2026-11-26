@@ -35,6 +35,8 @@ El flujo operativo consta de dos fases integradas en una interfaz gráfica de do
   - El repo `aarneth/inventario-ti` pasó a **público** (un repo privado exigiría meter un token en el `.exe`). Se revisó todo el historial antes: sin contraseñas, tokens ni datos del inventario.
   - Kaspersky: se publica normal; si el `.exe` nuevo queda bloqueado hasta que Seguridad TI apruebe el hash, el técnico usa `Iniciar_Inventario.bat` (el programa lo indica si no puede abrir el `.exe`).
   - Probado de punta a punta en ambos modos (`.exe` y `.bat`): una copia v1.2.0 encontró el release v1.2.1, lo instaló y se reabrió como v1.2.1, sin tocar reportes ni configuración.
+- **Ajustes del Excel e importación (2026-11-26):** tras revisar un Excel real se cambió la consolidación: MODELO solo con el modelo comercial (`Pro Mini 400 G9`, `ProBook 450 G10`), usuarios sin las cuentas locales de soporte ni `soporte.ti`, cuentas `doc*`/`alu*` como DOCENTE/ALUMNO con correo `N/A`, monitores `N/A` en laptops y valores de remachado uniformes (`CON REMACHE/CON CADENA`, etc.).
+  - Para equipos administrativos con USB bloqueada se agregó el menú `Archivo > Importar reportes (.txt)` / `Importar carpeta de reportes`: el reporte se genera en el equipo (programa desde carpeta de red o descargado del release), se trae por red/correo/Teams/OneDrive y se importa a la USB con la misma comparación campo por campo.
 
 ## 3. Estructura Exacta de Columnas del Excel Maestro
 1. `TIPO` (`PC` o `LAPTOP`)
@@ -48,16 +50,16 @@ El flujo operativo consta de dos fases integradas en una interfaz gráfica de do
 9. `DISCO DURO` (normalizado comercialmente: `500 GB`, `512 GB`, `1 TB`, `256 GB`)
 10. `MAC ADDRESS` (formato con dos puntos en mayúsculas: `24:FB:E3:C1:37:EE`)
 11. `HOST NAME`
-12. `MONITOR-MODELO` (vacío en `LAPTOP`)
-13. `SERIE MONITOR` (vacío en `LAPTOP`)
+12. `MONITOR-MODELO` (`N/A` en `LAPTOP`)
+13. `SERIE MONITOR` (`N/A` en `LAPTOP`)
 14. `AREA` (ej. `SAE`, `VENTAS`, `SOPORTE TÉCNICO`, `AULA 101`, `LABORATORIO DE COMPUTO 100`)
 15. `REMACHADO / CADENA DE SEGURIDAD`
 16. `AULA / LAB / ADMINISTRATIVO` (`ADMINISTRATIVO` para administrativos, o el nombre del aula/laboratorio)
 17. `FECHA DE INVENTARIO` (`yyyy-MM-dd`)
 18. `ORGANIZACIÓN` (`IDAC` para Carrión, `UPNW` u otra sigla configurable para Wiener)
 19. `ANTIVIRUS` (`SÍ` solo si se detecta Kaspersky; `NO` si no; `NO VERIFICADO` en reportes sin detección y filas manuales)
-20. `NOMBRE Y APELLIDO DE USUARIO` (`NOMBRE 1/NOMBRE 2` o `DOCENTE`)
-21. `CORREO DE USUARIO` (`correo1@dominio/correo2@dominio`)
+20. `NOMBRE Y APELLIDO DE USUARIO` (`NOMBRE 1/NOMBRE 2`, `DOCENTE` o `ALUMNO`; sin cuentas locales de soporte ni `soporte.ti`)
+21. `CORREO DE USUARIO` (`correo1@dominio/correo2@dominio`; `N/A` si solo hay DOCENTE/ALUMNO)
 22. `ABSOLUTE` (`SÍ` si se detecta el agente Absolute/Computrace; `NO` si no; `NO VERIFICADO` sin detección)
 23. `HP INSIGHTS` (en equipos HP: `SÍ`/`NO` según el agente HP Insights detectado, o `NO VERIFICADO`; otras marcas: siempre `NO`)
 24. `CONTRATO` (vacío para edición manual)
