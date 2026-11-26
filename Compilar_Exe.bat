@@ -15,6 +15,15 @@ if not exist "%CSC%" (
 
 set "OUT=%~dp0InventarioTI.exe"
 
+rem Copia del codigo con la credencial de Google Drive (build\google_oauth.local.json, fuera del repo)
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "build\preparar_fuente.ps1"
+if errorlevel 1 (
+    echo [ERROR] No se pudo preparar el codigo fuente.
+    popd
+    if /i not "%~1"=="/nopause" pause
+    exit /b 1
+)
+
 rem /codepage:65001 es obligatorio: el .cs esta en UTF-8 sin BOM y contiene tildes
 "%CSC%" /nologo /target:winexe /platform:anycpu /optimize+ /codepage:65001 ^
   /win32manifest:"src\app.manifest" ^
@@ -22,7 +31,7 @@ rem /codepage:65001 es obligatorio: el .cs esta en UTF-8 sin BOM y contiene tild
   /r:System.dll /r:System.Core.dll /r:System.Data.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll ^
   /r:System.Management.dll /r:System.DirectoryServices.dll /r:System.IO.Compression.dll ^
   /r:System.IO.Compression.FileSystem.dll /r:System.Web.Extensions.dll /r:System.Xml.dll ^
-  "src\InventarioApp.cs"
+  "obj\InventarioApp.build.cs"
 
 if errorlevel 1 (
     echo.

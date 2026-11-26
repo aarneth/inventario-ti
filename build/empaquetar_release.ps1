@@ -67,7 +67,9 @@ popd
 exit /b
 '@
 $header = ($header -replace "`r?`n", "`r`n")
-$csCrlf = ($cs -replace "`r?`n", "`r`n")
+# El .bat lleva el mismo codigo que el .exe (con la credencial de Google Drive si existe build\google_oauth.local.json)
+$csBuild = [IO.File]::ReadAllText((Join-Path $root 'obj\InventarioApp.build.cs'), [Text.Encoding]::UTF8)
+$csCrlf = ($csBuild -replace "`r?`n", "`r`n")
 $batText = $header + "`r`n" + $marker + "`r`n" + $csCrlf
 # UTF-8 SIN BOM: un BOM rompe la primera linea (@echo off) en cmd.exe
 [IO.File]::WriteAllText((Join-Path $stage 'Iniciar_Inventario.bat'), $batText, (New-Object Text.UTF8Encoding($false)))

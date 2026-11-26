@@ -120,6 +120,11 @@ namespace SistemaInventarioTI
         public Dictionary<string, string> Pisos { get; set; }
         // null (configuracion de versiones anteriores) = activado
         public bool? BuscarActualizaciones { get; set; }
+        // false = no preguntar si se sube el reporte a Google Drive al guardar (null = preguntar)
+        public bool? PreguntarSubirDrive { get; set; }
+        // Sede de Google Drive de esta USB ("CARRION/SJL") y reportes de Pendientes ya importados que no se pudieron mover
+        public string SedeDrive { get; set; }
+        public List<string> DriveImportados { get; set; }
     }
 
     public class MainForm : Form
@@ -344,6 +349,9 @@ namespace SistemaInventarioTI
                             pisosMap[kv.Key.ToUpper()] = kv.Value.ToUpper();
                     }
                     if (cfg.BuscarActualizaciones.HasValue) buscarActualizaciones = cfg.BuscarActualizaciones.Value;
+                    if (cfg.PreguntarSubirDrive.HasValue) preguntarSubirDrive = cfg.PreguntarSubirDrive.Value;
+                    if (!string.IsNullOrWhiteSpace(cfg.SedeDrive)) sedeDrive = cfg.SedeDrive.Trim();
+                    if (cfg.DriveImportados != null) driveImportadosIds = new List<string>(cfg.DriveImportados);
                 }
             }
             catch { }
@@ -359,6 +367,10 @@ namespace SistemaInventarioTI
                 cfg.Areas = areaMap;
                 cfg.Pisos = pisosMap;
                 cfg.BuscarActualizaciones = buscarActualizaciones;
+                cfg.PreguntarSubirDrive = preguntarSubirDrive;
+                cfg.SedeDrive = sedeDrive;
+                // Solo los ultimos 500 (cada entrada es id|fecha de un archivo de Pendientes)
+                cfg.DriveImportados = driveImportadosIds.Skip(Math.Max(0, driveImportadosIds.Count - 500)).ToList();
 
                 JavaScriptSerializer ser = new JavaScriptSerializer();
                 string json = ser.Serialize(cfg);
@@ -455,6 +467,30 @@ namespace SistemaInventarioTI
             mnuArchivo.DropDownItems.Add(new ToolStripSeparator());
             mnuArchivo.DropDownItems.Add(mnuOpenDir);
             menu.Items.Add(mnuArchivo);
+
+            ToolStripMenuItem mnuDrive = new ToolStripMenuItem("Google Drive");
+            ToolStripMenuItem mnuDriveUp = new ToolStripMenuItem("Subir \u00FAltimo reporte (equipo con USB bloqueada)");
+            mnuDriveUp.Click += delegate { UploadReportToDrive(lastSavedReportPath); };
+            ToolStripMenuItem mnuDriveImp = new ToolStripMenuItem("Importar pendientes de la sede");
+            mnuDriveImp.Click += delegate { ImportFromDrive(); };
+            ToolStripMenuItem mnuDriveBak = new ToolStripMenuItem("Respaldar todo en la nube");
+            mnuDriveBak.Click += delegate { BackupToDriveMenu(); };
+            ToolStripMenuItem mnuDriveSede = new ToolStripMenuItem("Cambiar sede de esta USB...");
+            mnuDriveSede.Click += delegate { ChangeDriveSede(); };
+            ToolStripMenuItem mnuDriveAdm = new ToolStripMenuItem("Administrar sedes y t\u00E9cnicos...");
+            mnuDriveAdm.Click += delegate { ShowDriveAdmin(); };
+            mnuDrive.DropDownItems.Add(mnuDriveUp);
+            mnuDrive.DropDownItems.Add(mnuDriveImp);
+            mnuDrive.DropDownItems.Add(mnuDriveBak);
+            mnuDrive.DropDownItems.Add(new ToolStripSeparator());
+            mnuDrive.DropDownItems.Add(mnuDriveSede);
+            mnuDrive.DropDownItems.Add(mnuDriveAdm);
+            mnuDrive.DropDownOpening += delegate {
+                mnuDriveSede.Text = sedeDrive.Length > 0
+                    ? "Cambiar sede de esta USB (actual: " + sedeDrive.Replace("/", " / ") + ")..."
+                    : "Elegir sede de esta USB...";
+            };
+            menu.Items.Add(mnuDrive);
 
             ToolStripMenuItem mnuAyuda = new ToolStripMenuItem("Ayuda");
             ToolStripMenuItem mnuAcerca = new ToolStripMenuItem("Acerca de...");
@@ -1411,6 +1447,1240 @@ namespace SistemaInventarioTI
             return mons;
         }
 
+        // ===================== Google Drive (equipos con la USB bloqueada) =====================
+        // Cada tecnico inicia sesion con SU cuenta de Google en el navegador (OAuth 2.0 para apps de escritorio con
+        // PKCE y redireccion a 127.0.0.1). La sesion solo vive en memoria mientras el programa esta abierto: no se
+        // guarda ningun token en disco. Los reportes se suben a la carpeta compartida GDRIVE_FOLDER (creada en la cuenta
+        // del responsable y compartida como editor con los tecnicos) y, al importarlos a la USB, se mueven a la
+        // subcarpeta "Importados". La credencial del proyecto de Google Cloud se inserta al compilar
+        // (build\preparar_fuente.ps1 + build\google_oauth.local.json); en el repositorio quedan los marcadores.
+
+        private const string GOOGLE_CLIENT_ID = "__GOOGLE_CLIENT_ID__";
+        private const string GOOGLE_CLIENT_SECRET = "__GOOGLE_CLIENT_SECRET__";
+        private const string GDRIVE_SCOPE = "https://www.googleapis.com/auth/drive";
+        private const string GDRIVE_FOLDER = "Inventario TI - Reportes";
+        private const string GDRIVE_IMPORTED = "Importados";
+        private const string GDRIVE_API = "https://www.googleapis.com/drive/v3/";
+        private const string FOLDER_MIME = "application/vnd.google-apps.folder";
+
+        private string gAccessToken = null;
+        private DateTime gTokenExpiryUtc = DateTime.MinValue;
+        private string gUserEmail = "";
+        private bool preguntarSubirDrive = true;
+
+        private static bool GoogleConfigured()
+        {
+            return GOOGLE_CLIENT_ID.IndexOf(".apps.googleusercontent.com", StringComparison.OrdinalIgnoreCase) > 0;
+        }
+
+        private bool EnsureGoogleConfigured()
+        {
+            if (GoogleConfigured()) return true;
+            MessageBox.Show("Esta copia del programa no tiene configurada la conexi\u00F3n con Google Drive.\n\n" +
+                "Usa el programa del release (InventarioTI_v*.zip) o, si eres el responsable, revisa docs\\GOOGLE_DRIVE.md.",
+                "Google Drive", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return false;
+        }
+
+        private static string Base64Url(byte[] data)
+        {
+            return Convert.ToBase64String(data).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+        }
+
+        private static string RandomUrlSafe(int bytes)
+        {
+            byte[] b = new byte[bytes];
+            using (System.Security.Cryptography.RandomNumberGenerator rng = System.Security.Cryptography.RandomNumberGenerator.Create())
+                rng.GetBytes(b);
+            return Base64Url(b);
+        }
+
+        private static string PkceChallenge(string verifier)
+        {
+            using (System.Security.Cryptography.SHA256 sha = System.Security.Cryptography.SHA256.Create())
+                return Base64Url(sha.ComputeHash(Encoding.ASCII.GetBytes(verifier)));
+        }
+
+        // "/?state=abc&code=4%2F0A..." -> diccionario
+        private static Dictionary<string, string> ParseQueryString(string pathAndQuery)
+        {
+            Dictionary<string, string> res = new Dictionary<string, string>(StringComparer.Ordinal);
+            int q = (pathAndQuery ?? "").IndexOf('?');
+            if (q < 0) return res;
+            foreach (string part in pathAndQuery.Substring(q + 1).Split('&'))
+            {
+                if (part.Length == 0) continue;
+                int eq = part.IndexOf('=');
+                string k = Uri.UnescapeDataString((eq < 0 ? part : part.Substring(0, eq)).Replace('+', ' '));
+                string v = eq < 0 ? "" : Uri.UnescapeDataString(part.Substring(eq + 1).Replace('+', ' '));
+                res[k] = v;
+            }
+            return res;
+        }
+
+        private static void WriteHttpResponse(Stream s, int status, string html)
+        {
+            byte[] body = Encoding.UTF8.GetBytes(html ?? "");
+            string head = string.Format("HTTP/1.1 {0} {1}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {2}\r\nConnection: close\r\n\r\n",
+                status, status == 200 ? "OK" : "Not Found", body.Length);
+            byte[] h = Encoding.ASCII.GetBytes(head);
+            s.Write(h, 0, h.Length);
+            s.Write(body, 0, body.Length);
+            s.Flush();
+        }
+
+        private static string LoopbackPage(bool ok)
+        {
+            return "<!doctype html><html><head><meta charset=\"utf-8\"><title>Inventario TI</title></head>" +
+                "<body style=\"font-family:Segoe UI,Arial,sans-serif;background:#f1f5f9;color:#0f172a;padding:48px\">" +
+                (ok ? "<h2>Sesi\u00F3n iniciada</h2><p>Ya puedes cerrar esta pesta\u00F1a y volver al programa Inventario TI.</p>"
+                    : "<h2>No se pudo iniciar sesi\u00F3n</h2><p>Vuelve al programa Inventario TI e int\u00E9ntalo de nuevo.</p>") +
+                "</body></html>";
+        }
+
+        // Atiende UNA redireccion de Google en el listener. Devuelve el "code" o null (y el error).
+        // Las peticiones que no traen code/error (ej. /favicon.ico) se responden con 404 y se sigue esperando.
+        private static string WaitForOAuthRedirect(TcpListener listener, string expectedState, out string error)
+        {
+            error = null;
+            while (true)
+            {
+                using (TcpClient client = listener.AcceptTcpClient())
+                {
+                    NetworkStream ns = client.GetStream();
+                    ns.ReadTimeout = 10000;
+                    StreamReader sr = new StreamReader(ns, Encoding.ASCII);
+                    string requestLine = sr.ReadLine() ?? "";
+                    Match m = Regex.Match(requestLine, @"^GET\s+(\S+)");
+                    Dictionary<string, string> q = ParseQueryString(m.Success ? m.Groups[1].Value : "");
+                    if (!q.ContainsKey("code") && !q.ContainsKey("error"))
+                    {
+                        WriteHttpResponse(ns, 404, "");
+                        continue;
+                    }
+                    string st;
+                    bool stateOk = q.TryGetValue("state", out st) && st == expectedState;
+                    bool ok = stateOk && q.ContainsKey("code");
+                    WriteHttpResponse(ns, 200, LoopbackPage(ok));
+                    if (ok) return q["code"];
+                    error = q.ContainsKey("error") ? q["error"] : "respuesta no v\u00E1lida (state)";
+                    return null;
+                }
+            }
+        }
+
+        // Peticion a la API de Google; devuelve el JSON como diccionario. Los errores incluyen el mensaje de Google.
+        private static Dictionary<string, object> GoogleRequest(string method, string url, string token, string contentType, byte[] body)
+        {
+            EnableTls12();
+            HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
+            req.Method = method;
+            req.UserAgent = UPDATE_UA;
+            req.Timeout = 30000;
+            req.ReadWriteTimeout = 30000;
+            if (token != null) req.Headers[HttpRequestHeader.Authorization] = "Bearer " + token;
+            if (body != null)
+            {
+                req.ContentType = contentType;
+                req.ContentLength = body.Length;
+                using (Stream s = req.GetRequestStream()) s.Write(body, 0, body.Length);
+            }
+            try
+            {
+                using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
+                using (StreamReader sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+                {
+                    string txt = sr.ReadToEnd();
+                    if (txt.Trim().Length == 0) return new Dictionary<string, object>();
+                    JavaScriptSerializer ser = new JavaScriptSerializer();
+                    ser.MaxJsonLength = int.MaxValue;
+                    return ser.Deserialize<Dictionary<string, object>>(txt);
+                }
+            }
+            catch (WebException wex)
+            {
+                throw new Exception(GoogleErrorMessage(wex));
+            }
+        }
+
+        private static byte[] GoogleDownload(string url, string token)
+        {
+            EnableTls12();
+            HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
+            req.UserAgent = UPDATE_UA;
+            req.Timeout = 30000;
+            req.Headers[HttpRequestHeader.Authorization] = "Bearer " + token;
+            try
+            {
+                using (WebResponse resp = req.GetResponse())
+                using (Stream s = resp.GetResponseStream())
+                using (MemoryStream ms = new MemoryStream())
+                {
+                    s.CopyTo(ms);
+                    return ms.ToArray();
+                }
+            }
+            catch (WebException wex)
+            {
+                throw new Exception(GoogleErrorMessage(wex));
+            }
+        }
+
+        private static string GoogleErrorMessage(WebException wex)
+        {
+            string msg = wex.Message;
+            try
+            {
+                if (wex.Response != null)
+                {
+                    using (StreamReader sr = new StreamReader(wex.Response.GetResponseStream(), Encoding.UTF8))
+                    {
+                        string txt = sr.ReadToEnd();
+                        Dictionary<string, object> d = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(txt);
+                        if (d != null && d.ContainsKey("error"))
+                        {
+                            Dictionary<string, object> e = d["error"] as Dictionary<string, object>;
+                            if (e != null && e.ContainsKey("message")) msg = Convert.ToString(e["message"]);
+                            else
+                            {
+                                msg = Convert.ToString(d["error"]);
+                                if (d.ContainsKey("error_description")) msg += ": " + Convert.ToString(d["error_description"]);
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+            return msg;
+        }
+
+        private static string FormEncode(Dictionary<string, string> data)
+        {
+            List<string> parts = new List<string>();
+            foreach (KeyValuePair<string, string> kv in data)
+                parts.Add(Uri.EscapeDataString(kv.Key) + "=" + Uri.EscapeDataString(kv.Value ?? ""));
+            return string.Join("&", parts.ToArray());
+        }
+
+        // Inicio de sesion en el navegador. Devuelve el access token o null si se cancelo / fallo.
+        private string GetGoogleAccessToken()
+        {
+            if (!EnsureGoogleConfigured()) return null;
+            if (gAccessToken != null && DateTime.UtcNow < gTokenExpiryUtc.AddMinutes(-2)) return gAccessToken;
+
+            string verifier = RandomUrlSafe(48);
+            string state = RandomUrlSafe(18);
+            TcpListener listener = new TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
+            int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+            string redirect = "http://127.0.0.1:" + port;
+            string authUrl = "https://accounts.google.com/o/oauth2/v2/auth?" + FormEncode(new Dictionary<string, string> {
+                { "client_id", GOOGLE_CLIENT_ID }, { "redirect_uri", redirect }, { "response_type", "code" },
+                { "scope", GDRIVE_SCOPE }, { "code_challenge", PkceChallenge(verifier) }, { "code_challenge_method", "S256" },
+                { "state", state }, { "prompt", "select_account" } });
+
+            string code = null;
+            string error = null;
+            bool terminado = false;
+            Thread th = new Thread(delegate()
+            {
+                try { code = WaitForOAuthRedirect(listener, state, out error); }
+                catch { if (error == null) error = "cancelado"; }
+                terminado = true;
+            });
+            th.IsBackground = true;
+            th.Start();
+
+            using (Form dlg = new Form())
+            {
+                dlg.Text = "Iniciar sesi\u00F3n con Google";
+                dlg.FormBorderStyle = FormBorderStyle.FixedDialog;
+                dlg.ControlBox = false;
+                dlg.ShowInTaskbar = false;
+                dlg.StartPosition = FormStartPosition.CenterParent;
+                dlg.ClientSize = new Size(460, 150);
+                dlg.Font = new Font("Segoe UI", 9.5F);
+                Label lbl = new Label();
+                lbl.Text = "Se abri\u00F3 el navegador. Elige tu cuenta de Google y acepta los permisos.\n" +
+                    "Si Google muestra \"Google no verific\u00F3 esta app\", usa Avanzado > Ir a Inventario TI.\n\n" +
+                    "Esta ventana se cerrar\u00E1 sola al terminar.";
+                lbl.Location = new Point(16, 14);
+                lbl.Size = new Size(430, 84);
+                Button bCancel = new Button();
+                bCancel.Text = "Cancelar";
+                bCancel.Size = new Size(100, 30);
+                bCancel.Location = new Point(344, 106);
+                bCancel.Click += delegate { error = "cancelado"; try { listener.Stop(); } catch { } };
+                System.Windows.Forms.Timer poll = new System.Windows.Forms.Timer();
+                poll.Interval = 300;
+                DateTime limite = DateTime.Now.AddMinutes(5);
+                poll.Tick += delegate
+                {
+                    if (DateTime.Now > limite && !terminado) { error = "tiempo de espera agotado"; try { listener.Stop(); } catch { } }
+                    if (terminado) { poll.Stop(); dlg.Close(); }
+                };
+                dlg.Controls.AddRange(new Control[] { lbl, bCancel });
+                dlg.Shown += delegate
+                {
+                    try { Process.Start(authUrl); }
+                    catch (Exception ex) { error = "no se pudo abrir el navegador: " + ex.Message; try { listener.Stop(); } catch { } }
+                    poll.Start();
+                };
+                dlg.ShowDialog(this);
+                poll.Dispose();
+            }
+            try { listener.Stop(); } catch { }
+            this.Activate();
+
+            if (code == null)
+            {
+                if (error != "cancelado")
+                    MessageBox.Show("No se pudo iniciar sesi\u00F3n con Google: " + error, "Google Drive", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return null;
+            }
+
+            try
+            {
+                Dictionary<string, object> tok = GoogleRequest("POST", "https://oauth2.googleapis.com/token", null,
+                    "application/x-www-form-urlencoded", Encoding.ASCII.GetBytes(FormEncode(new Dictionary<string, string> {
+                        { "code", code }, { "client_id", GOOGLE_CLIENT_ID }, { "client_secret", GOOGLE_CLIENT_SECRET },
+                        { "redirect_uri", redirect }, { "grant_type", "authorization_code" }, { "code_verifier", verifier } })));
+                gAccessToken = Convert.ToString(tok["access_token"]);
+                int secs = 3600;
+                if (tok.ContainsKey("expires_in")) int.TryParse(Convert.ToString(tok["expires_in"]), out secs);
+                gTokenExpiryUtc = DateTime.UtcNow.AddSeconds(secs);
+                gUserEmail = "";
+                try
+                {
+                    Dictionary<string, object> about = GoogleRequest("GET", GDRIVE_API + "about?fields=user(emailAddress)", gAccessToken, null, null);
+                    Dictionary<string, object> u = about["user"] as Dictionary<string, object>;
+                    if (u != null) gUserEmail = Convert.ToString(u["emailAddress"]);
+                }
+                catch { }
+                return gAccessToken;
+            }
+            catch (Exception ex)
+            {
+                gAccessToken = null;
+                MessageBox.Show("Google rechaz\u00F3 el inicio de sesi\u00F3n: " + ex.Message, "Google Drive", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return null;
+            }
+        }
+
+        private static string DriveQ(string s)
+        {
+            return (s ?? "").Replace("\\", "\\\\").Replace("'", "\\'");
+        }
+
+        private static List<Dictionary<string, object>> DriveList(string token, string q, string fields)
+        {
+            List<Dictionary<string, object>> res = new List<Dictionary<string, object>>();
+            string pageToken = null;
+            do
+            {
+                string url = GDRIVE_API + "files?pageSize=1000&q=" + Uri.EscapeDataString(q) +
+                    "&fields=" + Uri.EscapeDataString("nextPageToken,files(" + fields + ")") +
+                    (pageToken != null ? "&pageToken=" + Uri.EscapeDataString(pageToken) : "");
+                Dictionary<string, object> r = GoogleRequest("GET", url, token, null, null);
+                System.Collections.IEnumerable files = r.ContainsKey("files") ? r["files"] as System.Collections.IEnumerable : null;
+                if (files != null)
+                    foreach (object o in files)
+                    {
+                        Dictionary<string, object> d = o as Dictionary<string, object>;
+                        if (d != null) res.Add(d);
+                    }
+                pageToken = r.ContainsKey("nextPageToken") ? Convert.ToString(r["nextPageToken"]) : null;
+            } while (!string.IsNullOrEmpty(pageToken));
+            return res;
+        }
+
+        // ---------- Estructura en Drive ----------
+        // Inventario TI - Reportes (raiz, del responsable)
+        //   CARRION / WIENER (institucion)
+        //     <SEDE> (compartida como Editor con los tecnicos de esa sede)
+        //       Respaldo   = copia exacta de la USB de la sede (txt vigentes, historial, Excel, config)
+        //       Pendientes = reportes subidos desde equipos con la USB bloqueada; al importarlos pasan a Importados
+        // Cada carpeta lleva propiedades (invTI = raiz/inst/sede/respaldo/pendientes, invKey = "CARRION/SJL") para
+        // encontrarla aunque el tecnico no vea las carpetas superiores (solo se le comparte su sede).
+
+        private static readonly string[] SEDES_POR_DEFECTO = new string[] {
+            "CARRION/SJL", "CARRION/SJM", "CARRION/SARMIENTO", "CARRION/LOS OLIVOS", "CARRION/SAN LUIS", "CARRION/MENDIOLA",
+            "WIENER/LOCAL 1", "WIENER/LOCAL 2", "WIENER/LOCAL 4", "WIENER/LOCAL 5", "WIENER/LIMA NORTE"
+        };
+        private string sedeDrive = "";
+        private List<string> driveImportadosIds = new List<string>();
+
+        private class DriveSede
+        {
+            public string Id;
+            public string Key;     // "CARRION/SJL"
+            public bool Owned;
+        }
+
+        private class RemoteEntry
+        {
+            public string Id;
+            public string Md5;
+            public string ParentId;
+        }
+
+        private static string PropQ(string key, string value)
+        {
+            return string.Format("properties has {{ key='{0}' and value='{1}' }}", key, DriveQ(value));
+        }
+
+        private static string DriveCreateFolderP(string token, string name, string parentId, Dictionary<string, string> props)
+        {
+            Dictionary<string, object> meta = new Dictionary<string, object>();
+            meta["name"] = name;
+            meta["mimeType"] = FOLDER_MIME;
+            if (parentId != null) meta["parents"] = new string[] { parentId };
+            if (props != null) meta["properties"] = props;
+            byte[] body = Encoding.UTF8.GetBytes(new JavaScriptSerializer().Serialize(meta));
+            Dictionary<string, object> r = GoogleRequest("POST", GDRIVE_API + "files?fields=id", token, "application/json; charset=UTF-8", body);
+            return Convert.ToString(r["id"]);
+        }
+
+        private static Dictionary<string, string> Props(string tipo, string key)
+        {
+            Dictionary<string, string> p = new Dictionary<string, string>();
+            p["invTI"] = tipo;
+            if (key != null) p["invKey"] = key;
+            return p;
+        }
+
+        // Sedes a las que esta cuenta tiene acceso (el responsable: todas; un tecnico: las que se le compartieron)
+        private static List<DriveSede> ListDriveSedes(string token, bool soloPropias)
+        {
+            List<DriveSede> res = new List<DriveSede>();
+            string q = string.Format("mimeType='{0}' and trashed=false and {1}", FOLDER_MIME, PropQ("invTI", "sede"));
+            if (soloPropias) q += " and 'me' in owners";
+            foreach (Dictionary<string, object> f in DriveList(token, q, "id,name,ownedByMe,properties"))
+            {
+                Dictionary<string, object> pr = f.ContainsKey("properties") ? f["properties"] as Dictionary<string, object> : null;
+                string key = pr != null && pr.ContainsKey("invKey") ? Convert.ToString(pr["invKey"]) : Convert.ToString(f["name"]);
+                DriveSede s = new DriveSede();
+                s.Id = Convert.ToString(f["id"]);
+                s.Key = key;
+                s.Owned = f.ContainsKey("ownedByMe") && f["ownedByMe"] is bool && (bool)f["ownedByMe"];
+                if (!res.Any(x => string.Equals(x.Key, key, StringComparison.OrdinalIgnoreCase))) res.Add(s);
+            }
+            return res.OrderBy(x => x.Key).ToList();
+        }
+
+        // Subcarpeta Respaldo / Pendientes de una sede (se crea si falta: los tecnicos son editores de su sede)
+        private static string GetSedeSubfolder(string token, DriveSede sede, string tipo, string nombre)
+        {
+            List<Dictionary<string, object>> f = DriveList(token, string.Format("'{0}' in parents and mimeType='{1}' and trashed=false and {2}",
+                DriveQ(sede.Id), FOLDER_MIME, PropQ("invTI", tipo)), "id");
+            if (f.Count > 0) return Convert.ToString(f[0]["id"]);
+            return DriveCreateFolderP(token, nombre, sede.Id, Props(tipo, sede.Key));
+        }
+
+        // Sede de esta USB / equipo. Si no esta configurada (o ya no hay acceso), se elige entre las disponibles.
+        private DriveSede ChooseDriveSede(string token, bool forzarEleccion)
+        {
+            List<DriveSede> sedes = ListDriveSedes(token, false);
+            if (sedes.Count == 0)
+            {
+                MessageBox.Show(string.Format("La cuenta {0} no tiene acceso a ninguna carpeta de sede del inventario en Google Drive.\n\n" +
+                    "Si eres t\u00E9cnico, pide al responsable que te agregue a tu sede.\n" +
+                    "Si eres el responsable, usa Google Drive > Administrar sedes y t\u00E9cnicos.",
+                    gUserEmail.Length > 0 ? gUserEmail : "con la que iniciaste sesi\u00F3n"), "Google Drive", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return null;
+            }
+            if (!forzarEleccion)
+            {
+                DriveSede actual = sedes.FirstOrDefault(x => string.Equals(x.Key, sedeDrive, StringComparison.OrdinalIgnoreCase));
+                if (actual != null) return actual;
+                if (sedes.Count == 1)
+                {
+                    sedeDrive = sedes[0].Key;
+                    SaveConfig();
+                    return sedes[0];
+                }
+            }
+            using (Form dlg = new Form())
+            {
+                dlg.Text = "Sede de esta USB";
+                dlg.FormBorderStyle = FormBorderStyle.FixedDialog;
+                dlg.MaximizeBox = false;
+                dlg.MinimizeBox = false;
+                dlg.ShowInTaskbar = false;
+                dlg.StartPosition = FormStartPosition.CenterParent;
+                dlg.ClientSize = new Size(420, 140);
+                dlg.Font = new Font("Segoe UI", 9.5F);
+                Label lbl = new Label();
+                lbl.Text = "Elige la sede a la que pertenece esta USB (se recordar\u00E1):";
+                lbl.Location = new Point(16, 14);
+                lbl.AutoSize = true;
+                ComboBox cmb = new ComboBox();
+                cmb.DropDownStyle = ComboBoxStyle.DropDownList;
+                foreach (DriveSede s in sedes) cmb.Items.Add(s.Key.Replace("/", " / "));
+                int idx = sedes.FindIndex(x => string.Equals(x.Key, sedeDrive, StringComparison.OrdinalIgnoreCase));
+                cmb.SelectedIndex = idx >= 0 ? idx : 0;
+                cmb.Location = new Point(18, 42);
+                cmb.Size = new Size(384, 26);
+                Button bOk = new Button();
+                bOk.Text = "Aceptar";
+                bOk.DialogResult = DialogResult.OK;
+                bOk.Size = new Size(100, 30);
+                bOk.Location = new Point(196, 94);
+                Button bNo = new Button();
+                bNo.Text = "Cancelar";
+                bNo.DialogResult = DialogResult.Cancel;
+                bNo.Size = new Size(100, 30);
+                bNo.Location = new Point(302, 94);
+                dlg.AcceptButton = bOk;
+                dlg.CancelButton = bNo;
+                dlg.Controls.AddRange(new Control[] { lbl, cmb, bOk, bNo });
+                if (dlg.ShowDialog(this) != DialogResult.OK) return null;
+                sedeDrive = sedes[cmb.SelectedIndex].Key;
+                SaveConfig();
+                return sedes[cmb.SelectedIndex];
+            }
+        }
+
+        private void ChangeDriveSede()
+        {
+            string token = GetGoogleAccessToken();
+            if (token == null) return;
+            try
+            {
+                DriveSede s = ChooseDriveSede(token, true);
+                if (s != null) lblStatusText.Text = "Sede de Google Drive de esta USB: " + s.Key.Replace("/", " / ");
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("No se pudo leer Google Drive:\n" + ex.Message, "Google Drive", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private static byte[] BuildMultipartRelated(string boundary, string metadataJson, byte[] content, string contentType)
+        {
+            using (MemoryStream ms = new MemoryStream())
+            {
+                byte[] a = Encoding.UTF8.GetBytes("--" + boundary + "\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n" + metadataJson +
+                    "\r\n--" + boundary + "\r\nContent-Type: " + contentType + "\r\n\r\n");
+                byte[] z = Encoding.UTF8.GetBytes("\r\n--" + boundary + "--\r\n");
+                ms.Write(a, 0, a.Length);
+                ms.Write(content, 0, content.Length);
+                ms.Write(z, 0, z.Length);
+                return ms.ToArray();
+            }
+        }
+
+        private static string MimeFor(string name)
+        {
+            string ext = Path.GetExtension(name ?? "").ToLowerInvariant();
+            if (ext == ".xlsx") return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+            if (ext == ".json") return "application/json";
+            return "text/plain";
+        }
+
+        // Crea (existingId == null) o reemplaza el contenido de un archivo en Drive
+        private static string DriveUploadFile(string token, string existingId, string parentId, string name, byte[] content)
+        {
+            string boundary = "inventario_" + Guid.NewGuid().ToString("N");
+            string mime = MimeFor(name);
+            string url;
+            string method;
+            string meta;
+            if (existingId != null)
+            {
+                url = "https://www.googleapis.com/upload/drive/v3/files/" + Uri.EscapeDataString(existingId) + "?uploadType=multipart&fields=id";
+                method = "PATCH";
+                meta = "{}";
+            }
+            else
+            {
+                url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id";
+                method = "POST";
+                Dictionary<string, object> m = new Dictionary<string, object>();
+                m["name"] = name;
+                m["mimeType"] = mime;
+                m["parents"] = new string[] { parentId };
+                meta = new JavaScriptSerializer().Serialize(m);
+            }
+            Dictionary<string, object> r = GoogleRequest(method, url, token, "multipart/related; boundary=" + boundary,
+                BuildMultipartRelated(boundary, meta, content, mime + (mime.StartsWith("text/") ? "; charset=UTF-8" : "")));
+            return Convert.ToString(r["id"]);
+        }
+
+        // En Drive personal solo el DUENO de un archivo puede mandarlo a la papelera. Si falla (archivo de otro
+        // tecnico), se intenta quitarlo de la carpeta. Devuelve null si se pudo, o el motivo.
+        private static string DriveRemove(string token, string id, string parentId)
+        {
+            try
+            {
+                GoogleRequest("PATCH", GDRIVE_API + "files/" + Uri.EscapeDataString(id) + "?fields=id", token,
+                    "application/json; charset=UTF-8", Encoding.UTF8.GetBytes("{\"trashed\":true}"));
+                return null;
+            }
+            catch (Exception ex1)
+            {
+                try
+                {
+                    GoogleRequest("PATCH", GDRIVE_API + "files/" + Uri.EscapeDataString(id) + "?removeParents=" + Uri.EscapeDataString(parentId) + "&fields=id",
+                        token, "application/json; charset=UTF-8", Encoding.UTF8.GetBytes("{}"));
+                    return null;
+                }
+                catch { return ex1.Message; }
+            }
+        }
+
+        private static string Md5Hex(string path)
+        {
+            try
+            {
+                using (System.Security.Cryptography.MD5 md5 = System.Security.Cryptography.MD5.Create())
+                using (FileStream fs = File.OpenRead(path))
+                {
+                    byte[] h = md5.ComputeHash(fs);
+                    StringBuilder sb = new StringBuilder();
+                    foreach (byte b in h) sb.Append(b.ToString("x2"));
+                    return sb.ToString();
+                }
+            }
+            catch { return null; }   // equipos con politica FIPS: se sube siempre
+        }
+
+        // ---------- Subir desde un equipo con la USB bloqueada ----------
+
+        private void UploadReportToDrive(string path)
+        {
+            if (string.IsNullOrEmpty(path) || !File.Exists(path))
+            {
+                using (OpenFileDialog dlg = new OpenFileDialog())
+                {
+                    dlg.Title = "Elige el reporte .txt a subir a Google Drive";
+                    dlg.Filter = "Reportes de inventario (*.txt)|*.txt";
+                    dlg.InitialDirectory = baseDir;
+                    if (dlg.ShowDialog(this) != DialogResult.OK) return;
+                    path = dlg.FileName;
+                }
+            }
+            string token = GetGoogleAccessToken();
+            if (token == null) return;
+            this.Cursor = Cursors.WaitCursor;
+            try
+            {
+                lblStatusText.Text = "Subiendo reporte a Google Drive...";
+                Application.DoEvents();
+                DriveSede sede = ChooseDriveSede(token, false);
+                if (sede == null) return;
+                string pendId = GetSedeSubfolder(token, sede, "pendientes", "Pendientes");
+                string name = Path.GetFileName(path);
+                // Si el mismo equipo ya esta pendiente de importar, se reemplaza (no se duplica)
+                List<Dictionary<string, object>> same = DriveList(token,
+                    string.Format("name='{0}' and '{1}' in parents and trashed=false", DriveQ(name), DriveQ(pendId)), "id");
+                DriveUploadFile(token, same.Count > 0 ? Convert.ToString(same[0]["id"]) : null, pendId, name, File.ReadAllBytes(path));
+                lblStatusText.Text = "Reporte subido a Google Drive: " + name;
+                MessageBox.Show(string.Format("Reporte subido a Google Drive{0}:\n{1}\n\nSede: {2}  (carpeta Pendientes)\n\n" +
+                    "Si este equipo no es tuyo, cierra tu sesi\u00F3n de Google en el navegador.",
+                    gUserEmail.Length > 0 ? " (" + gUserEmail + ")" : "", name, sede.Key.Replace("/", " / ")),
+                    "Google Drive", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                lblStatusText.Text = "No se pudo subir el reporte a Google Drive.";
+                MessageBox.Show("No se pudo subir el reporte a Google Drive:\n" + ex.Message, "Google Drive", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            finally
+            {
+                this.Cursor = Cursors.Default;
+            }
+        }
+
+        // ---------- Importar los pendientes de la sede a la USB ----------
+
+        private void ImportFromDrive()
+        {
+            string token = GetGoogleAccessToken();
+            if (token == null) return;
+            string work = Path.Combine(Path.GetTempPath(), "InventarioTI_drive_" + DateTime.Now.ToString("yyyyMMdd_HHmmss"));
+            Dictionary<string, string> idByLocal = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            DriveSede sede;
+            string pendId;
+            this.Cursor = Cursors.WaitCursor;
+            try
+            {
+                lblStatusText.Text = "Buscando reportes pendientes en Google Drive...";
+                Application.DoEvents();
+                sede = ChooseDriveSede(token, false);
+                if (sede == null) return;
+                pendId = GetSedeSubfolder(token, sede, "pendientes", "Pendientes");
+                List<Dictionary<string, object>> files = DriveList(token,
+                    string.Format("'{0}' in parents and trashed=false and mimeType!='{1}'", DriveQ(pendId), FOLDER_MIME), "id,name,modifiedTime");
+                int n = 0;
+                foreach (Dictionary<string, object> f in files)
+                {
+                    string id = Convert.ToString(f["id"]);
+                    string marca = id + "|" + (f.ContainsKey("modifiedTime") ? Convert.ToString(f["modifiedTime"]) : "");
+                    if (driveImportadosIds.Contains(marca)) continue;   // ya importado (no se pudo mover por permisos)
+                    string name = Regex.Replace(Convert.ToString(f["name"]), @"[\\/:*?""<>|]", "_");
+                    if (!name.EndsWith(".txt", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (n == 0) Directory.CreateDirectory(work);
+                    lblStatusText.Text = string.Format("Descargando {0}: {1}", ++n, name);
+                    Application.DoEvents();
+                    string dir = Path.Combine(work, n.ToString("000"));
+                    Directory.CreateDirectory(dir);
+                    string local = Path.Combine(dir, name);
+                    File.WriteAllBytes(local, GoogleDownload(GDRIVE_API + "files/" + Uri.EscapeDataString(id) + "?alt=media", token));
+                    idByLocal[local] = marca;
+                }
+            }
+            catch (Exception ex)
+            {
+                lblStatusText.Text = "No se pudo leer Google Drive.";
+                MessageBox.Show("No se pudieron descargar los reportes de Google Drive:\n" + ex.Message, "Google Drive", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+            finally
+            {
+                this.Cursor = Cursors.Default;
+            }
+            if (idByLocal.Count == 0)
+            {
+                lblStatusText.Text = "No hay reportes pendientes en Google Drive.";
+                MessageBox.Show(string.Format("No hay reportes pendientes en la sede {0}.", sede.Key.Replace("/", " / ")), "Google Drive", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            Dictionary<string, string> resultado = ImportReports(new List<string>(idByLocal.Keys));
+
+            // Incorporados (nuevos, actualizados o sin cambios) -> Pendientes/Importados; los omitidos quedan pendientes
+            int movidos = 0, incorporados = 0;
+            List<string> errores = new List<string>();
+            try
+            {
+                string impId = null;
+                foreach (KeyValuePair<string, string> kv in idByLocal)
+                {
+                    string res;
+                    if (!resultado.TryGetValue(kv.Key, out res) || (res != "nuevo" && res != "actualizado" && res != "sin cambios")) continue;
+                    if (res != "sin cambios") incorporados++;
+                    string fileId = kv.Value.Split('|')[0];
+                    if (impId == null)
+                    {
+                        List<Dictionary<string, object>> sub = DriveList(token,
+                            string.Format("mimeType='{0}' and name='{1}' and '{2}' in parents and trashed=false", FOLDER_MIME, GDRIVE_IMPORTED, DriveQ(pendId)), "id");
+                        impId = sub.Count > 0 ? Convert.ToString(sub[0]["id"]) : DriveCreateFolderP(token, GDRIVE_IMPORTED, pendId, null);
+                    }
+                    try
+                    {
+                        GoogleRequest("PATCH", GDRIVE_API + "files/" + Uri.EscapeDataString(fileId) + "?addParents=" + Uri.EscapeDataString(impId) +
+                            "&removeParents=" + Uri.EscapeDataString(pendId) + "&fields=id", token, "application/json; charset=UTF-8", Encoding.UTF8.GetBytes("{}"));
+                        movidos++;
+                    }
+                    catch (Exception ex)
+                    {
+                        // Sin permiso para moverlo (archivo de otro tecnico): se recuerda para no volver a importarlo
+                        if (!driveImportadosIds.Contains(kv.Value)) driveImportadosIds.Add(kv.Value);
+                        errores.Add(Path.GetFileName(kv.Key) + ": " + ex.Message);
+                    }
+                }
+                if (errores.Count > 0) SaveConfig();
+            }
+            catch (Exception ex) { errores.Add(ex.Message); }
+            try { Directory.Delete(work, true); } catch { }
+
+            lblStatusText.Text = string.Format("Google Drive: {0} reporte(s) movido(s) a \"{1}\".", movidos, GDRIVE_IMPORTED);
+            if (errores.Count > 0)
+                MessageBox.Show("Los reportes se incorporaron a la USB, pero algunos no se pudieron mover a \"" + GDRIVE_IMPORTED + "\" en Google Drive " +
+                    "(el programa los recordar\u00E1 para no importarlos otra vez):\n\n" + string.Join("\n", errores.Take(10).ToArray()),
+                    "Google Drive", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+
+            // Lo importado tambien queda en el Respaldo de la sede
+            if (incorporados > 0) SyncBackupToDrive(token, sede, true);
+        }
+
+        // ---------- Respaldo: copia exacta de la USB en la nube ----------
+
+        // Ruta relativa con "/" -> ruta local. Incluye txt vigentes e historial de las 3 categorias, Excel consolidado y config.
+        private Dictionary<string, string> CollectBackupFiles()
+        {
+            Dictionary<string, string> res = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            string root = baseDir.TrimEnd('\\') + "\\";
+            foreach (string cat in new string[] { "ADMINISTRATIVOS", "AULAS", "LABORATORIO" })
+            {
+                string dir = Path.Combine(baseDir, cat);
+                if (!Directory.Exists(dir)) continue;
+                List<string> files = new List<string>();
+                CollectTxtFilesSafe(dir, files, 0);
+                foreach (string f in files)
+                    if (f.StartsWith(root, StringComparison.OrdinalIgnoreCase)) res[f.Substring(root.Length).Replace('\\', '/')] = f;
+            }
+            try
+            {
+                foreach (string f in Directory.GetFiles(baseDir, "Inventario_Consolidado*.xlsx"))
+                    if (!Path.GetFileName(f).StartsWith("~$")) res[Path.GetFileName(f)] = f;
+            }
+            catch { }
+            if (File.Exists(configPath)) res[Path.GetFileName(configPath)] = configPath;
+            return res;
+        }
+
+        private static void ListRemoteTree(string token, string folderId, string prefix, Dictionary<string, RemoteEntry> files,
+            Dictionary<string, RemoteEntry> folders, List<RemoteEntry> duplicados, int depth)
+        {
+            if (depth > 8) return;
+            foreach (Dictionary<string, object> f in DriveList(token, string.Format("'{0}' in parents and trashed=false", DriveQ(folderId)), "id,name,mimeType,md5Checksum"))
+            {
+                string name = Convert.ToString(f["name"]);
+                string rel = prefix.Length == 0 ? name : prefix + "/" + name;
+                RemoteEntry e = new RemoteEntry();
+                e.Id = Convert.ToString(f["id"]);
+                e.ParentId = folderId;
+                e.Md5 = f.ContainsKey("md5Checksum") ? Convert.ToString(f["md5Checksum"]) : null;
+                if (Convert.ToString(f["mimeType"]) == FOLDER_MIME)
+                {
+                    if (folders.ContainsKey(rel)) { duplicados.Add(e); continue; }
+                    folders[rel] = e;
+                    ListRemoteTree(token, e.Id, rel, files, folders, duplicados, depth + 1);
+                }
+                else if (files.ContainsKey(rel)) duplicados.Add(e);
+                else files[rel] = e;
+            }
+        }
+
+        private void BackupToDriveMenu()
+        {
+            string token = GetGoogleAccessToken();
+            if (token == null) return;
+            DriveSede sede;
+            try { sede = ChooseDriveSede(token, false); }
+            catch (Exception ex)
+            {
+                MessageBox.Show("No se pudo leer Google Drive:\n" + ex.Message, "Google Drive", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+            if (sede == null) return;
+            DialogResult dr = MessageBox.Show(string.Format(
+                "Se dejar\u00E1 la carpeta Respaldo de la sede {0} igual a esta USB:\n\n" +
+                "\u2022 se suben los reportes, el historial, el Excel consolidado y la configuraci\u00F3n nuevos o cambiados;\n" +
+                "\u2022 lo que ya no est\u00E1 en la USB se manda a la papelera de Drive (recuperable 30 d\u00EDas).\n\n\u00BFContinuar?",
+                sede.Key.Replace("/", " / ")), "Respaldar en la nube", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            if (dr == DialogResult.Yes) SyncBackupToDrive(token, sede, false);
+        }
+
+        private void SyncBackupToDrive(string token, DriveSede sede, bool trasImportar)
+        {
+            int subidos = 0, actualizados = 0, iguales = 0, borrados = 0;
+            List<string> errores = new List<string>();
+            this.Cursor = Cursors.WaitCursor;
+            try
+            {
+                lblStatusText.Text = "Respaldo: revisando la nube...";
+                Application.DoEvents();
+                string respId = GetSedeSubfolder(token, sede, "respaldo", "Respaldo");
+                Dictionary<string, RemoteEntry> rFiles = new Dictionary<string, RemoteEntry>(StringComparer.OrdinalIgnoreCase);
+                Dictionary<string, RemoteEntry> rFolders = new Dictionary<string, RemoteEntry>(StringComparer.OrdinalIgnoreCase);
+                List<RemoteEntry> duplicados = new List<RemoteEntry>();
+                ListRemoteTree(token, respId, "", rFiles, rFolders, duplicados, 0);
+                Dictionary<string, string> local = CollectBackupFiles();
+
+                int i = 0;
+                foreach (KeyValuePair<string, string> kv in local.OrderBy(x => x.Key))
+                {
+                    i++;
+                    try
+                    {
+                        RemoteEntry re;
+                        string md5 = Md5Hex(kv.Value);
+                        if (rFiles.TryGetValue(kv.Key, out re))
+                        {
+                            if (md5 != null && re.Md5 != null && string.Equals(md5, re.Md5, StringComparison.OrdinalIgnoreCase)) { iguales++; continue; }
+                            lblStatusText.Text = string.Format("Respaldo ({0}/{1}): actualizando {2}", i, local.Count, kv.Key);
+                            Application.DoEvents();
+                            DriveUploadFile(token, re.Id, null, Path.GetFileName(kv.Value), File.ReadAllBytes(kv.Value));
+                            actualizados++;
+                        }
+                        else
+                        {
+                            lblStatusText.Text = string.Format("Respaldo ({0}/{1}): subiendo {2}", i, local.Count, kv.Key);
+                            Application.DoEvents();
+                            // Crear las carpetas que falten (ADMINISTRATIVOS/SAE/...)
+                            string parent = respId;
+                            string acc = "";
+                            string[] parts = kv.Key.Split('/');
+                            for (int p = 0; p < parts.Length - 1; p++)
+                            {
+                                acc = acc.Length == 0 ? parts[p] : acc + "/" + parts[p];
+                                RemoteEntry fe;
+                                if (!rFolders.TryGetValue(acc, out fe))
+                                {
+                                    fe = new RemoteEntry();
+                                    fe.Id = DriveCreateFolderP(token, parts[p], parent, null);
+                                    fe.ParentId = parent;
+                                    rFolders[acc] = fe;
+                                }
+                                parent = fe.Id;
+                            }
+                            DriveUploadFile(token, null, parent, parts[parts.Length - 1], File.ReadAllBytes(kv.Value));
+                            subidos++;
+                        }
+                    }
+                    catch (Exception ex) { errores.Add(kv.Key + ": " + ex.Message); }
+                }
+
+                // Copia exacta: lo que ya no esta en la USB se quita del Respaldo
+                foreach (KeyValuePair<string, RemoteEntry> kv in rFiles)
+                {
+                    if (local.ContainsKey(kv.Key)) continue;
+                    string err = DriveRemove(token, kv.Value.Id, kv.Value.ParentId);
+                    if (err == null) borrados++; else errores.Add("No se pudo quitar " + kv.Key + ": " + err);
+                }
+                foreach (RemoteEntry d in duplicados)
+                {
+                    string err = DriveRemove(token, d.Id, d.ParentId);
+                    if (err == null) borrados++;
+                }
+                // Carpetas que quedaron sin ningun archivo de la USB (solo la mas alta de cada rama)
+                List<string> vacias = rFolders.Keys.Where(f => !local.Keys.Any(l => l.StartsWith(f + "/", StringComparison.OrdinalIgnoreCase)))
+                    .OrderBy(f => f.Length).ToList();
+                List<string> quitadas = new List<string>();
+                foreach (string f in vacias)
+                {
+                    if (quitadas.Any(q => f.StartsWith(q + "/", StringComparison.OrdinalIgnoreCase))) continue;
+                    if (DriveRemove(token, rFolders[f].Id, rFolders[f].ParentId) == null) quitadas.Add(f);
+                }
+            }
+            catch (Exception ex)
+            {
+                errores.Add(ex.Message);
+            }
+            finally
+            {
+                this.Cursor = Cursors.Default;
+            }
+
+            string resumen = string.Format("Respaldo de la sede {0}:\n\nSubidos: {1}   Actualizados: {2}   Sin cambios: {3}   Quitados: {4}",
+                sede.Key.Replace("/", " / "), subidos, actualizados, iguales, borrados);
+            lblStatusText.Text = string.Format("Respaldo en la nube: {0} subido(s), {1} actualizado(s), {2} quitado(s).", subidos, actualizados, borrados);
+            if (errores.Count > 0)
+                MessageBox.Show(resumen + "\n\nAvisos:\n" + string.Join("\n", errores.Take(12).ToArray()) +
+                    (errores.Count > 12 ? string.Format("\n... y {0} m\u00E1s", errores.Count - 12) : ""),
+                    "Respaldar en la nube", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            else if (!trasImportar || subidos + actualizados + borrados > 0)
+                MessageBox.Show(resumen, "Respaldar en la nube", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        // ---------- Administracion (solo el responsable, dueno de la carpeta raiz) ----------
+
+        private string FindOrCreateDriveRoot(string token)
+        {
+            List<Dictionary<string, object>> found = DriveList(token, string.Format(
+                "mimeType='{0}' and name='{1}' and trashed=false and 'me' in owners", FOLDER_MIME, DriveQ(GDRIVE_FOLDER)), "id,properties");
+            if (found.Count > 0)
+            {
+                string id = Convert.ToString(found[0]["id"]);
+                if (!found[0].ContainsKey("properties"))
+                {
+                    Dictionary<string, object> m = new Dictionary<string, object>();
+                    m["properties"] = Props("raiz", null);
+                    GoogleRequest("PATCH", GDRIVE_API + "files/" + Uri.EscapeDataString(id) + "?fields=id", token, "application/json; charset=UTF-8",
+                        Encoding.UTF8.GetBytes(new JavaScriptSerializer().Serialize(m)));
+                }
+                return id;
+            }
+            DialogResult dr = MessageBox.Show(string.Format(
+                "No tienes la carpeta \"{0}\" en tu Google Drive ({1}).\n\n\u00BFCrearla con las carpetas de CARRION y WIENER y sus sedes?\n\n" +
+                "Hazlo solo si eres el RESPONSABLE del inventario.", GDRIVE_FOLDER, gUserEmail), "Google Drive", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            if (dr != DialogResult.Yes) return null;
+            return DriveCreateFolderP(token, GDRIVE_FOLDER, null, Props("raiz", null));
+        }
+
+        private static string EnsureInstFolder(string token, string rootId, string inst)
+        {
+            List<Dictionary<string, object>> f = DriveList(token, string.Format("'{0}' in parents and mimeType='{1}' and trashed=false and {2}",
+                DriveQ(rootId), FOLDER_MIME, PropQ("invKey", inst)), "id");
+            if (f.Count > 0) return Convert.ToString(f[0]["id"]);
+            return DriveCreateFolderP(token, inst, rootId, Props("inst", inst));
+        }
+
+        private static DriveSede CreateDriveSede(string token, string rootId, string key)
+        {
+            string[] p = key.Split('/');
+            string instId = EnsureInstFolder(token, rootId, p[0]);
+            DriveSede s = new DriveSede();
+            s.Key = key;
+            s.Owned = true;
+            s.Id = DriveCreateFolderP(token, p[1], instId, Props("sede", key));
+            GetSedeSubfolder(token, s, "respaldo", "Respaldo");
+            GetSedeSubfolder(token, s, "pendientes", "Pendientes");
+            return s;
+        }
+
+        private class DrivePermission
+        {
+            public string Id;
+            public string Email;
+            public string Role;
+        }
+
+        private static List<DrivePermission> ListPermissions(string token, string fileId)
+        {
+            List<DrivePermission> res = new List<DrivePermission>();
+            Dictionary<string, object> r = GoogleRequest("GET", GDRIVE_API + "files/" + Uri.EscapeDataString(fileId) +
+                "/permissions?fields=" + Uri.EscapeDataString("permissions(id,emailAddress,role,type)"), token, null, null);
+            System.Collections.IEnumerable list = r.ContainsKey("permissions") ? r["permissions"] as System.Collections.IEnumerable : null;
+            if (list != null)
+                foreach (object o in list)
+                {
+                    Dictionary<string, object> d = o as Dictionary<string, object>;
+                    if (d == null) continue;
+                    string role = Convert.ToString(d["role"]);
+                    if (role == "owner") continue;
+                    DrivePermission p = new DrivePermission();
+                    p.Id = Convert.ToString(d["id"]);
+                    p.Email = d.ContainsKey("emailAddress") ? Convert.ToString(d["emailAddress"]) : Convert.ToString(d["type"]);
+                    p.Role = role == "writer" ? "Editor" : (role == "reader" ? "Lector" : role);
+                    res.Add(p);
+                }
+            return res.OrderBy(x => x.Email).ToList();
+        }
+
+        private void ShowDriveAdmin()
+        {
+            string token = GetGoogleAccessToken();
+            if (token == null) return;
+            string rootId;
+            List<DriveSede> sedes;
+            this.Cursor = Cursors.WaitCursor;
+            try
+            {
+                rootId = FindOrCreateDriveRoot(token);
+                if (rootId == null) return;
+                sedes = ListDriveSedes(token, true);
+                if (sedes.Count == 0)
+                {
+                    foreach (string k in SEDES_POR_DEFECTO)
+                    {
+                        lblStatusText.Text = "Creando sede " + k.Replace("/", " / ") + "...";
+                        Application.DoEvents();
+                        sedes.Add(CreateDriveSede(token, rootId, k));
+                    }
+                    lblStatusText.Text = "Estructura de sedes creada en Google Drive.";
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("No se pudo preparar la carpeta del inventario en Google Drive:\n" + ex.Message, "Google Drive", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+            finally
+            {
+                this.Cursor = Cursors.Default;
+            }
+
+            using (Form dlg = new Form())
+            {
+                dlg.Text = "Google Drive: sedes y t\u00E9cnicos";
+                dlg.FormBorderStyle = FormBorderStyle.FixedDialog;
+                dlg.MaximizeBox = false;
+                dlg.MinimizeBox = false;
+                dlg.ShowInTaskbar = false;
+                dlg.StartPosition = FormStartPosition.CenterParent;
+                dlg.ClientSize = new Size(720, 470);
+                dlg.Font = new Font("Segoe UI", 9.5F);
+                if (this.Icon != null) dlg.Icon = this.Icon;
+
+                Label l1 = new Label();
+                l1.Text = "Sedes";
+                l1.Font = new Font("Segoe UI", 9.5F, FontStyle.Bold);
+                l1.Location = new Point(14, 12);
+                l1.AutoSize = true;
+                ListBox lstSedes = new ListBox();
+                lstSedes.Location = new Point(16, 36);
+                lstSedes.Size = new Size(230, 340);
+                foreach (DriveSede s in sedes) lstSedes.Items.Add(s.Key.Replace("/", " / "));
+
+                Label l2 = new Label();
+                l2.Text = "T\u00E9cnicos con acceso a la sede (Editor)";
+                l2.Font = new Font("Segoe UI", 9.5F, FontStyle.Bold);
+                l2.Location = new Point(262, 12);
+                l2.AutoSize = true;
+                ListView lv = new ListView();
+                lv.View = View.Details;
+                lv.FullRowSelect = true;
+                lv.HideSelection = false;
+                lv.Location = new Point(264, 36);
+                lv.Size = new Size(440, 280);
+                lv.Columns.Add("Gmail", 320);
+                lv.Columns.Add("Permiso", 100);
+
+                Button bAdd = new Button();
+                bAdd.Text = "Agregar t\u00E9cnico...";
+                bAdd.Size = new Size(150, 30);
+                bAdd.Location = new Point(264, 324);
+                Button bDel = new Button();
+                bDel.Text = "Quitar acceso";
+                bDel.Size = new Size(130, 30);
+                bDel.Location = new Point(420, 324);
+                Button bSede = new Button();
+                bSede.Text = "Agregar sede...";
+                bSede.Size = new Size(230, 30);
+                bSede.Location = new Point(16, 384);
+
+                Label note = new Label();
+                note.Text = "Cada t\u00E9cnico debe estar tambi\u00E9n en \"Usuarios de prueba\" del proyecto de Google Cloud; si no, Google le bloquear\u00E1 el inicio de sesi\u00F3n.";
+                note.ForeColor = Color.FromArgb(146, 64, 14);
+                note.Location = new Point(264, 362);
+                note.Size = new Size(440, 40);
+
+                Button bClose = new Button();
+                bClose.Text = "Cerrar";
+                bClose.DialogResult = DialogResult.Cancel;
+                bClose.Size = new Size(110, 32);
+                bClose.Location = new Point(594, 424);
+                dlg.CancelButton = bClose;
+
+                List<DrivePermission> perms = new List<DrivePermission>();
+                MethodInvoker cargar = delegate
+                {
+                    lv.Items.Clear();
+                    perms.Clear();
+                    if (lstSedes.SelectedIndex < 0) return;
+                    dlg.Cursor = Cursors.WaitCursor;
+                    try
+                    {
+                        perms.AddRange(ListPermissions(token, sedes[lstSedes.SelectedIndex].Id));
+                        foreach (DrivePermission p in perms) lv.Items.Add(new ListViewItem(new string[] { p.Email, p.Role }));
+                    }
+                    catch (Exception ex) { MessageBox.Show(dlg, "No se pudieron leer los permisos:\n" + ex.Message, "Google Drive", MessageBoxButtons.OK, MessageBoxIcon.Error); }
+                    finally { dlg.Cursor = Cursors.Default; }
+                };
+                lstSedes.SelectedIndexChanged += delegate { cargar(); };
+
+                bAdd.Click += delegate
+                {
+                    if (lstSedes.SelectedIndex < 0) return;
+                    DriveSede s = sedes[lstSedes.SelectedIndex];
+                    string mail = PromptInput("Agregar t\u00E9cnico", string.Format("Gmail del t\u00E9cnico para la sede {0}:", s.Key.Replace("/", " / ")), "");
+                    if (string.IsNullOrWhiteSpace(mail)) return;
+                    mail = mail.Trim().ToLowerInvariant();
+                    if (!Regex.IsMatch(mail, @"^[^@\s]+@[^@\s]+\.[^@\s]+$"))
+                    {
+                        MessageBox.Show(dlg, "Ese correo no es v\u00E1lido.", "Google Drive", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        return;
+                    }
+                    try
+                    {
+                        Dictionary<string, object> body = new Dictionary<string, object>();
+                        body["type"] = "user";
+                        body["role"] = "writer";
+                        body["emailAddress"] = mail;
+                        GoogleRequest("POST", GDRIVE_API + "files/" + Uri.EscapeDataString(s.Id) + "/permissions?sendNotificationEmail=true&fields=id",
+                            token, "application/json; charset=UTF-8", Encoding.UTF8.GetBytes(new JavaScriptSerializer().Serialize(body)));
+                        cargar();
+                    }
+                    catch (Exception ex) { MessageBox.Show(dlg, "No se pudo dar acceso:\n" + ex.Message, "Google Drive", MessageBoxButtons.OK, MessageBoxIcon.Error); }
+                };
+
+                bDel.Click += delegate
+                {
+                    if (lstSedes.SelectedIndex < 0 || lv.SelectedIndices.Count == 0) return;
+                    DriveSede s = sedes[lstSedes.SelectedIndex];
+                    DrivePermission p = perms[lv.SelectedIndices[0]];
+                    if (MessageBox.Show(dlg, string.Format("\u00BFQuitar el acceso de {0} a la sede {1}?", p.Email, s.Key.Replace("/", " / ")),
+                        "Google Drive", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+                    try
+                    {
+                        GoogleRequest("DELETE", GDRIVE_API + "files/" + Uri.EscapeDataString(s.Id) + "/permissions/" + Uri.EscapeDataString(p.Id), token, null, null);
+                        cargar();
+                    }
+                    catch (Exception ex) { MessageBox.Show(dlg, "No se pudo quitar el acceso:\n" + ex.Message, "Google Drive", MessageBoxButtons.OK, MessageBoxIcon.Error); }
+                };
+
+                bSede.Click += delegate
+                {
+                    string inst = PromptInput("Agregar sede", "Instituci\u00F3n (CARRION o WIENER):", "CARRION");
+                    if (string.IsNullOrWhiteSpace(inst)) return;
+                    inst = SafeFolderName(inst);
+                    string nom = PromptInput("Agregar sede", "Nombre de la sede (ej. SJL, LOCAL 1):", "");
+                    if (string.IsNullOrWhiteSpace(nom)) return;
+                    string key = inst + "/" + SafeFolderName(nom).Replace("/", "-");
+                    if (sedes.Any(x => string.Equals(x.Key, key, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        MessageBox.Show(dlg, "Esa sede ya existe.", "Google Drive", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        return;
+                    }
+                    try
+                    {
+                        DriveSede s = CreateDriveSede(token, rootId, key);
+                        sedes.Add(s);
+                        sedes.Sort((a, b) => string.Compare(a.Key, b.Key, StringComparison.OrdinalIgnoreCase));
+                        lstSedes.Items.Clear();
+                        foreach (DriveSede x in sedes) lstSedes.Items.Add(x.Key.Replace("/", " / "));
+                        lstSedes.SelectedIndex = sedes.IndexOf(s);
+                    }
+                    catch (Exception ex) { MessageBox.Show(dlg, "No se pudo crear la sede:\n" + ex.Message, "Google Drive", MessageBoxButtons.OK, MessageBoxIcon.Error); }
+                };
+
+                dlg.Controls.AddRange(new Control[] { l1, lstSedes, l2, lv, bAdd, bDel, bSede, note, bClose });
+                dlg.Shown += delegate { if (lstSedes.Items.Count > 0) lstSedes.SelectedIndex = 0; };
+                dlg.ShowDialog(this);
+            }
+        }
+
+        private bool IsRemovableBaseDir()
+        {
+            try
+            {
+                if (baseDir.StartsWith(@"\\")) return false;
+                return new DriveInfo(Path.GetPathRoot(baseDir)).DriveType == DriveType.Removable;
+            }
+            catch { return false; }
+        }
+
+        // Tras GUARDAR: si el programa NO corre desde una USB (equipo con la USB bloqueada), ofrece subir el reporte
+        private void OfferDriveUploadAfterSave()
+        {
+            string path = lastSavedReportPath;
+            if (!GoogleConfigured() || !preguntarSubirDrive || string.IsNullOrEmpty(path) || !File.Exists(path)) return;
+            if (IsRemovableBaseDir()) return;
+            using (Form dlg = new Form())
+            {
+                dlg.Text = "Google Drive";
+                dlg.FormBorderStyle = FormBorderStyle.FixedDialog;
+                dlg.MaximizeBox = false;
+                dlg.MinimizeBox = false;
+                dlg.ShowInTaskbar = false;
+                dlg.StartPosition = FormStartPosition.CenterParent;
+                dlg.ClientSize = new Size(440, 150);
+                dlg.Font = new Font("Segoe UI", 9.5F);
+                Label lbl = new Label();
+                lbl.Text = "\u00BFSubir este reporte a Google Drive?\n\n\u00DAsalo si este equipo tiene la USB bloqueada: luego se importa a la USB de la sede con Google Drive > Importar pendientes de la sede.";
+                lbl.Location = new Point(16, 12);
+                lbl.Size = new Size(410, 70);
+                CheckBox chk = new CheckBox();
+                chk.Text = "No volver a preguntar en esta carpeta";
+                chk.Location = new Point(18, 112);
+                chk.AutoSize = true;
+                Button bYes = new Button();
+                bYes.Text = "Subir";
+                bYes.DialogResult = DialogResult.Yes;
+                bYes.Size = new Size(90, 30);
+                bYes.Location = new Point(242, 84);
+                Button bNo = new Button();
+                bNo.Text = "No";
+                bNo.DialogResult = DialogResult.No;
+                bNo.Size = new Size(90, 30);
+                bNo.Location = new Point(338, 84);
+                dlg.AcceptButton = bYes;
+                dlg.CancelButton = bNo;
+                dlg.Controls.AddRange(new Control[] { lbl, chk, bYes, bNo });
+                DialogResult dr = dlg.ShowDialog(this);
+                if (chk.Checked)
+                {
+                    preguntarSubirDrive = false;
+                    SaveConfig();
+                }
+                if (dr == DialogResult.Yes) UploadReportToDrive(path);
+            }
+        }
+
         // ===================== Archivo: importar reportes de otros equipos =====================
         // Para equipos con la USB bloqueada: el programa se ejecuta en ese equipo desde una carpeta de red o descargado
         // del release, el .txt se trae por red / correo / Teams / OneDrive y aqui se incorpora a la USB: cada reporte va a
@@ -1471,8 +2741,10 @@ namespace SistemaInventarioTI
             }
         }
 
-        private void ImportReports(List<string> files)
+        // Devuelve, por ruta de archivo: "nuevo", "actualizado", "sin cambios", "omitido", "ignorado" o "error"
+        private Dictionary<string, string> ImportReports(List<string> files)
         {
+            Dictionary<string, string> resultado = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             int nuevos = 0, actualizados = 0, sinCambios = 0, omitidos = 0, ignorados = 0;
             List<string> errores = new List<string>();
             List<string> detalle = new List<string>();
@@ -1483,9 +2755,10 @@ namespace SistemaInventarioTI
                 try
                 {
                     // Los archivos de historial (con fecha) no son reportes vigentes
-                    if (Regex.IsMatch(Path.GetFileNameWithoutExtension(src), @"_\d{8}_\d{6}$")) { ignorados++; continue; }
+                    resultado[src] = "error";
+                    if (Regex.IsMatch(Path.GetFileNameWithoutExtension(src), @"_\d{8}_\d{6}$")) { ignorados++; resultado[src] = "ignorado"; continue; }
                     string[] lines = File.ReadAllLines(src, Encoding.UTF8);
-                    if (string.Join("\n", lines).IndexOf("INVENTARIO DE HARDWARE Y RED", StringComparison.Ordinal) < 0) { ignorados++; continue; }
+                    if (string.Join("\n", lines).IndexOf("INVENTARIO DE HARDWARE Y RED", StringComparison.Ordinal) < 0) { ignorados++; resultado[src] = "ignorado"; continue; }
 
                     InventoryReport nuevo = ParseReport(lines);
                     string host = nuevo.Get("Hostname").Trim();
@@ -1494,30 +2767,33 @@ namespace SistemaInventarioTI
                     string destino = GetReportPath(nuevo);
                     int cantidad;
                     FileInfo previo = FindExistingReport(host, destino, out cantidad);
-                    if (previo != null && PathsEqual(previo.FullName, src)) { sinCambios++; continue; }
+                    if (previo != null && PathsEqual(previo.FullName, src)) { sinCambios++; resultado[src] = "sin cambios"; continue; }
 
                     if (previo == null)
                     {
                         WriteReportFile(destino, nuevo);
                         nuevos++;
+                        resultado[src] = "nuevo";
                         detalle.Add("NUEVO        " + host + "  ->  " + RelPath(destino));
                         continue;
                     }
 
                     InventoryReport anterior = ParseReport(File.ReadAllLines(previo.FullName, Encoding.UTF8));
                     List<FieldDiff> diffs = ComputeReportDiffs(anterior, nuevo);
-                    if (diffs.Count == 0) { sinCambios++; continue; }
+                    if (diffs.Count == 0) { sinCambios++; resultado[src] = "sin cambios"; continue; }
 
                     int op = ShowFieldDiffDialog(host, previo, cantidad, anterior, destino, diffs);
                     if (op != 1 && op != 2)
                     {
                         omitidos++;
+                        resultado[src] = "omitido";
                         detalle.Add("OMITIDO      " + host);
                         continue;
                     }
                     InventoryReport final;
                     ApplyReportSave(previo, anterior, nuevo, diffs, op, out final);
                     actualizados++;
+                    resultado[src] = "actualizado";
                     detalle.Add("ACTUALIZADO  " + host + "  ->  " + RelPath(GetReportPath(final)));
                 }
                 catch (Exception ex)
@@ -1547,6 +2823,7 @@ namespace SistemaInventarioTI
             lblStatusText.Text = string.Format("Importaci\u00F3n: {0} nuevo(s), {1} actualizado(s), {2} sin cambios.", nuevos, actualizados, sinCambios);
             MessageBox.Show(sb.ToString(), "Importar reportes", MessageBoxButtons.OK,
                 errores.Count > 0 ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
+            return resultado;
         }
 
         private void OpenLastReportFolder()
@@ -2758,6 +4035,7 @@ namespace SistemaInventarioTI
                 WriteReportFile(destino, nuevo);
                 MessageBox.Show("Reporte guardado en subcarpeta:\n" + destino, "Reporte Guardado", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 UpdateTxtCounterBadge();
+                OfferDriveUploadAfterSave();
                 return;
             }
 
@@ -2772,6 +4050,7 @@ namespace SistemaInventarioTI
                 {
                     WriteReportFile(previo.FullName, nuevo);
                     lblStatusText.Text = "Fecha de auditor\u00EDa actualizada en " + previo.FullName;
+                    OfferDriveUploadAfterSave();
                 }
                 return;
             }
@@ -2793,6 +4072,7 @@ namespace SistemaInventarioTI
             LoadReportIntoUI(final);
             UpdateTxtCounterBadge();
             MessageBox.Show(resumen, "Reporte Actualizado", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            OfferDriveUploadAfterSave();
         }
 
         // op: 1 = archivar el reporte ANTERIOR con fecha y dejar el nuevo como vigente; 2 = sin historial

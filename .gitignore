@@ -7,3 +7,7 @@ config_inventario.json
 .claude/settings.local.json
 # Paquetes generados por Empaquetar_Release.bat (se publican como assets del release)
 dist/
+# Codigo preparado para compilar (incluye la credencial de Google Drive)
+obj/
+# Credencial de Google Drive (app de escritorio): nunca se versiona
+build/google_oauth.local.json
